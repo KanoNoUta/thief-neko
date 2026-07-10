@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createGatewayServer } from '../src/server.js';
+import { CatpawCredentialManager } from '../src/catpawCredentials.js';
 import { UsageStore } from '../src/usageStore.js';
 
 test('gateway uses Catpaw native Agent protocol for a complete Claude tool loop', async (t) => {
@@ -156,6 +157,111 @@ test('gateway uses Catpaw native Agent protocol for tool-free auxiliary requests
     upstreamRequest.agentModeConfig.tools.find((tool) => tool.toolUseName === 'use_mcp_tool'),
     { toolUseName: 'use_mcp_tool', enable: true, mcpTools: [] },
   );
+});
+
+test('gateway refreshes Catpaw credentials and replays one unauthorized request', async (t) => {
+  const attempts = [];
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    attempts.push({
+      token: req.headers['catpaw-auth'],
+      cookie: req.headers['catpaw-cookie'],
+      userMis: req.headers['user-mis-id'],
+    });
+    if (attempts.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"data":{"message":"auth failed"},"status":401}');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify({
+      id: 'chatcmpl-refreshed',
+      content: 'TOKEN_REFRESH_OK',
+      choices: [{ finishReason: 'stop' }],
+      lastOne: true,
+      statusCode: 0,
+    })}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const credentialManager = new CatpawCredentialManager({
+    token: 'old-token',
+    cookie: 'passport=old-token; sso=old-token',
+    userMis: 'old-user',
+    refreshAttempts: 1,
+    readSession: async () => ({ token: 'new-token', userMis: 'new-user' }),
+  });
+  const gateway = createGatewayServer({
+    upstreamUrl: `http://127.0.0.1:${upstream.address().port}/api/gpt/openai/stream`,
+    model: 'glm-5.2',
+    forceStream: true,
+    nativeAgent: true,
+    userModelTypeCode: 2,
+    encrypt: false,
+    debug: false,
+    extraHeaders: { 'Catpaw-Auth': 'old-token', 'user-mis-id': 'old-user' },
+    cookie: 'passport=old-token; sso=old-token',
+  }, { credentialManager });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(`http://127.0.0.1:${gateway.address().port}/v1/messages`, {
+    model: 'claude-fable-5',
+    stream: true,
+    messages: [{ role: 'user', content: 'continue the task' }],
+  });
+
+  assert.match(response, /TOKEN_REFRESH_OK/);
+  assert.deepEqual(attempts, [
+    { token: 'old-token', cookie: 'passport=old-token; sso=old-token', userMis: 'old-user' },
+    { token: 'new-token', cookie: 'passport=new-token; sso=new-token', userMis: 'new-user' },
+  ]);
+});
+
+test('gateway maps an unresolved Catpaw 401 to a temporary 503 without replaying', async (t) => {
+  let attempts = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    attempts += 1;
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end('{"data":{"message":"auth failed"},"status":401}');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const credentialManager = new CatpawCredentialManager({
+    token: 'same-token',
+    refreshAttempts: 1,
+    readSession: async () => ({ token: 'same-token', userMis: 'user-1' }),
+  });
+  const gateway = createGatewayServer({
+    upstreamUrl: `http://127.0.0.1:${upstream.address().port}/api/gpt/openai/stream`,
+    model: 'glm-5.2',
+    forceStream: true,
+    nativeAgent: true,
+    userModelTypeCode: 2,
+    encrypt: false,
+    debug: false,
+    extraHeaders: { 'Catpaw-Auth': 'same-token' },
+  }, { credentialManager });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await fetch(`http://127.0.0.1:${gateway.address().port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-fable-5',
+      stream: true,
+      messages: [{ role: 'user', content: 'continue the task' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error.type, 'upstream_auth_refresh_pending');
+  assert.equal(attempts, 1);
 });
 
 test('gateway injects Claude Desktop workspace mounts and rewrites native file tool paths', async (t) => {

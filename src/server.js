@@ -21,9 +21,11 @@ import {
   summarizeCatpawToolCalls,
 } from './catpawAgent.js';
 import { resolveClaudeWorkspaceContext } from './claudeWorkspace.js';
+import { CatpawCredentialManager } from './catpawCredentials.js';
+import { readCatpawSessionAsync } from './catpawState.js';
 import { UsageStore, formatLocalDate, parseDateKey } from './usageStore.js';
 
-export function createGatewayServer(config) {
+export function createGatewayServer(config, dependencies = {}) {
   const limits = {
     maxAgentSessions: 128,
     agentSessionTtlMs: 6 * 60 * 60 * 1000,
@@ -40,10 +42,26 @@ export function createGatewayServer(config) {
     maxSuggestMappings: limits.maxSuggestMappings,
   });
   const usageStore = config.usageStore || new UsageStore(config.usageStorePath);
-  const metrics = createGatewayMetrics(config, limits, agentSessions, usageStore);
+  const credentialManager = dependencies.credentialManager || createCredentialManager(config);
+  credentialManager?.start();
+  const metrics = createGatewayMetrics(
+    config,
+    limits,
+    agentSessions,
+    usageStore,
+    credentialManager,
+  );
   const server = http.createServer(async (req, res) => {
     try {
-      await routeRequest(req, res, config, limits, agentSessions, metrics);
+      await routeRequest(
+        req,
+        res,
+        config,
+        limits,
+        agentSessions,
+        metrics,
+        credentialManager,
+      );
     } catch (error) {
       if (res.headersSent) {
         res.end();
@@ -58,10 +76,19 @@ export function createGatewayServer(config) {
   server.requestTimeout = limits.upstreamTimeoutMs + 30_000;
   server.headersTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
+  server.on('close', () => credentialManager?.stop());
   return server;
 }
 
-async function routeRequest(req, res, config, limits, agentSessions, metrics) {
+async function routeRequest(
+  req,
+  res,
+  config,
+  limits,
+  agentSessions,
+  metrics,
+  credentialManager,
+) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
 
   if (req.method === 'GET' && url.pathname === '/health') {
@@ -92,7 +119,15 @@ async function routeRequest(req, res, config, limits, agentSessions, metrics) {
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
     metrics.beginRequest();
     try {
-      await handleMessages(req, res, config, limits, agentSessions, metrics);
+      await handleMessages(
+        req,
+        res,
+        config,
+        limits,
+        agentSessions,
+        metrics,
+        credentialManager,
+      );
       metrics.completeRequest(true);
     } catch (error) {
       metrics.completeRequest(false, error.statusCode || 500);
@@ -107,7 +142,15 @@ async function routeRequest(req, res, config, limits, agentSessions, metrics) {
   });
 }
 
-async function handleMessages(req, res, config, limits, agentSessions, metrics) {
+async function handleMessages(
+  req,
+  res,
+  config,
+  limits,
+  agentSessions,
+  metrics,
+  credentialManager,
+) {
   const anthropicRequest = await readJson(req, limits.maxRequestBytes);
   const workspaceContext = await resolveClaudeWorkspaceContext({
     root: config.claudeSessionRoot,
@@ -135,8 +178,6 @@ async function handleMessages(req, res, config, limits, agentSessions, metrics) 
     : config.forceStream
       ? { ...openAIRequest, stream: true }
       : openAIRequest;
-  const headers = buildUpstreamHeaders(config);
-  const body = buildUpstreamBody(upstreamRequest, headers, config);
   await writeDebugRecord(config, {
     type: 'request',
     stream: clientWantsStream,
@@ -152,12 +193,12 @@ async function handleMessages(req, res, config, limits, agentSessions, metrics) 
   timeout.unref?.();
   let upstreamResponse;
   try {
-    upstreamResponse = await fetch(config.upstreamUrl, {
-      method: 'POST',
-      headers,
-      body,
-      signal: controller.signal,
-    });
+    upstreamResponse = await fetchWithCredentialRefresh(
+      config,
+      upstreamRequest,
+      credentialManager,
+      controller.signal,
+    );
   } catch (error) {
     if (error.name === 'AbortError') {
       error.statusCode = 504;
@@ -169,7 +210,11 @@ async function handleMessages(req, res, config, limits, agentSessions, metrics) 
   }
 
   if (!upstreamResponse.ok) {
-    await relayUpstreamError(res, upstreamResponse);
+    await relayUpstreamError(
+      res,
+      upstreamResponse,
+      Boolean(credentialManager && upstreamResponse.status === 401),
+    );
     return;
   }
 
@@ -207,7 +252,21 @@ async function handleMessages(req, res, config, limits, agentSessions, metrics) 
   sendJson(res, 200, openAIToAnthropicMessage(openAIResponse, config.model));
 }
 
-function buildUpstreamHeaders(config) {
+function createCredentialManager(config) {
+  const token = config.extraHeaders?.['Catpaw-Auth'];
+  if (!config.autoRefreshToken || !token) {
+    return null;
+  }
+  return new CatpawCredentialManager({
+    token,
+    cookie: config.cookie,
+    userMis: config.extraHeaders?.['user-mis-id'],
+    readSession: () => readCatpawSessionAsync(),
+    onRefresh: () => console.log('Catpaw credentials refreshed automatically'),
+  });
+}
+
+function buildUpstreamHeaders(config, credentialManager, credential) {
   const headers = {
     'Content-Type': 'application/json',
     Accept: config.forceStream ? 'text/event-stream' : 'application/json',
@@ -228,7 +287,54 @@ function buildUpstreamHeaders(config) {
     headers['Catpaw-Cookie'] = config.cookie;
   }
 
+  const current = credential || credentialManager?.snapshot();
+  if (current?.token) {
+    headers['Catpaw-Auth'] = current.token;
+  }
+  if (current?.cookie) {
+    headers.Cookie = current.cookie;
+    headers['Catpaw-Cookie'] = current.cookie;
+  }
+  if (current?.userMis) {
+    headers['user-mis-id'] = current.userMis;
+    headers['user-uid'] = current.userMis;
+    headers['mis-id'] = current.userMis;
+  }
+
   return headers;
+}
+
+async function fetchWithCredentialRefresh(
+  config,
+  upstreamRequest,
+  credentialManager,
+  signal,
+) {
+  const sendAttempt = async () => {
+    const credential = credentialManager?.snapshot();
+    const headers = buildUpstreamHeaders(config, credentialManager, credential);
+    const body = buildUpstreamBody(upstreamRequest, headers, config);
+    const response = await fetch(config.upstreamUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+    });
+    return { response, token: credential?.token || '' };
+  };
+
+  const first = await sendAttempt();
+  if (first.response.status !== 401 || !credentialManager) {
+    return first.response;
+  }
+
+  const changed = await credentialManager.refreshAfterUnauthorized(first.token);
+  if (!changed) {
+    return first.response;
+  }
+
+  await first.response.body?.cancel();
+  return (await sendAttempt()).response;
 }
 
 function buildUpstreamBody(openAIRequest, headers, config) {
@@ -473,13 +579,13 @@ function writeNewEvents(res, events, emitted) {
   return events.length;
 }
 
-async function relayUpstreamError(res, upstreamResponse) {
+async function relayUpstreamError(res, upstreamResponse, temporaryAuthFailure = false) {
   const rawBody = await upstreamResponse.text();
   const body = decryptUpstreamBody(rawBody, upstreamResponse);
-  sendJson(res, upstreamResponse.status, {
+  sendJson(res, temporaryAuthFailure ? 503 : upstreamResponse.status, {
     type: 'error',
     error: {
-      type: 'upstream_error',
+      type: temporaryAuthFailure ? 'upstream_auth_refresh_pending' : 'upstream_error',
       message: body || upstreamResponse.statusText,
     },
   });
@@ -579,7 +685,13 @@ function isLoopback(host) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
-function createGatewayMetrics(config, limits, agentSessions, usageStore) {
+function createGatewayMetrics(
+  config,
+  limits,
+  agentSessions,
+  usageStore,
+  credentialManager,
+) {
   const startedAt = Date.now();
   const quotaUrl = config.upstreamBaseUrl
     ? `${config.upstreamBaseUrl.replace(/\/+$/, '')}/api/user/limit`
@@ -647,7 +759,10 @@ function createGatewayMetrics(config, limits, agentSessions, usageStore) {
       quotaRequest = (async () => {
         quotaLastFetchedAt = Date.now();
         try {
-          const headers = buildUpstreamHeaders({ ...config, forceStream: false });
+          const headers = buildUpstreamHeaders(
+            { ...config, forceStream: false },
+            credentialManager,
+          );
           headers.Accept = 'application/json';
           const response = await fetch(quotaUrl, {
             method: 'GET',

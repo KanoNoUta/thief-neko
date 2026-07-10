@@ -9,11 +9,13 @@ $ErrorActionPreference = "Stop"
 
 Set-Location -LiteralPath $PSScriptRoot
 
-$state = node src/catpawState.js | ConvertFrom-Json
 if (-not $NonInteractive -and [string]::IsNullOrWhiteSpace($Token)) {
   $Token = Read-Host "Catpaw access token (blank: read Catpaw state)"
 }
-if ([string]::IsNullOrWhiteSpace($Token)) {
+$autoToken = [string]::IsNullOrWhiteSpace($Token)
+$state = $null
+if ($autoToken) {
+  $state = node src/catpawState.js | ConvertFrom-Json
   $Token = $state.token
 }
 if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -27,7 +29,7 @@ if (-not $NonInteractive) {
   }
 }
 
-$userMis = $state.userMis
+$userMis = if ($state) { $state.userMis } else { "" }
 
 $existing = Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($existing) {
@@ -49,6 +51,7 @@ $env:CATPAW_USER_MIS_ID = $userMis
 $env:CATPAW_ENCRYPT = "1"
 $env:CATPAW_FORCE_STREAM = "1"
 $env:CATPAW_NATIVE_AGENT = "1"
+$env:CATPAW_AUTO_REFRESH_TOKEN = if ($autoToken) { "1" } else { "0" }
 $env:CATPAW_MODEL_TYPE = "2"
 $env:CATPAW_DEBUG = if ($DebugGateway) { "1" } else { "0" }
 $env:CATPAW_HEADERS = '{"ide-type":"CatPaw IDE","client-type":"CatPaw IDE","ide-version":"2026.2.3","plugin-id":"mt-idekit.mt-idekit-code","plugin-version":"2026.2.2","client-env":"LOCAL_IDE","platform-info":"win32-x64","UI-Version":"0.2.2"}'

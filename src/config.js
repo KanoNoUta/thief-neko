@@ -32,6 +32,7 @@ export function loadConfig(env = process.env) {
       env.CATPAW_NATIVE_AGENT,
       upstreamUrl.includes('/api/gpt/openai/stream'),
     ),
+    autoRefreshToken: parseBoolean(env.CATPAW_AUTO_REFRESH_TOKEN, false),
     userModelTypeCode: parseModelType(env.CATPAW_MODEL_TYPE),
     claudeSessionRoot: resolveClaudeSessionRoot(env),
     usageStorePath: resolveUsageStorePath(env),

@@ -152,6 +152,19 @@ test('loadConfig enables native Agent protocol for the Catpaw stream endpoint', 
   assert.equal(config.userModelTypeCode, 2);
 });
 
+test('loadConfig enables runtime Token refresh only when requested', () => {
+  const disabled = loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.meituan.com',
+  });
+  const enabled = loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.meituan.com',
+    CATPAW_AUTO_REFRESH_TOKEN: '1',
+  });
+
+  assert.equal(disabled.autoRefreshToken, false);
+  assert.equal(enabled.autoRefreshToken, true);
+});
+
 test('loadConfig maps Catpaw user id headers', () => {
   const config = loadConfig({
     CATPAW_BASE_URL: 'https://catpaw.meituan.com',

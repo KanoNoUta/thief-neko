@@ -17,7 +17,7 @@ Claude Code Desktop -> http://127.0.0.1:3000/v1/messages
 - Windows 主机路径与 Claude Desktop VM 路径转换
 - Catpaw Agent 会话隔离、重复文本折叠和工具参数适配
 - Windows 桌面控制器、托盘、启动/停止和加密 Token 保存
-- 启动时自动读取 Catpaw 最新 Token，失败时回退到手动 Token
+- 自动读取并热更新 Catpaw Token，认证轮换时透明重试一次
 - Catpaw 剩余次数、输入/输出 Token、内存和活动状态
 - 按自然日保存 Token 历史，支持 1 天、7 天、30 天和自定义日期范围
 - 请求体、流缓冲、会话数量和上游超时限制
@@ -34,7 +34,7 @@ Release 中的 `ThiefNeko.exe` 已包含 .NET 运行时，不需要另外安装 
 
 ## 安装和启动
 
-1. 从 GitHub Releases 下载 `Thief-Neko-v0.1.2-win-x64.zip`。
+1. 从 GitHub Releases 下载 `Thief-Neko-v0.1.3-win-x64.zip`。
 2. 完整解压，不能只把 EXE 单独拿出来；程序需要同目录中的 `src`。
 3. 确认 Catpaw 已登录。
 4. 双击 `ThiefNeko.exe`。
@@ -71,7 +71,7 @@ $state.token | Set-Clipboard
 
 执行后 Token 已进入剪贴板，直接粘贴到 Thief Neko 的 `CATPAW TOKEN` 输入框。
 
-勾选 Token 输入框下方的“自动获取 Catpaw Token”后，Thief Neko 会在每次启动或重启网关前读取 Catpaw 当前登录状态。读取成功时会自动更新本机加密保存的 Token；读取失败时会使用输入框中保存的手动 Token，并在活动列表显示提示。该功能不会发送模型请求或消耗 Catpaw 推理次数。
+勾选 Token 输入框下方的“自动获取 Catpaw Token”后，Thief Neko 会在启动网关前读取 Catpaw 当前登录状态，并在运行期间每 5 秒检查一次。Token 发生轮换时会直接热更新内存中的请求凭证；如果某个请求先收到 401，网关会读取最新 Token 并透明重试一次。读取失败时会保留上一个可用 Token。该功能不会主动发送模型请求或消耗 Catpaw 推理次数。
 
 如果输出为空或报登录状态不存在：
 
@@ -170,7 +170,7 @@ powershell -ExecutionPolicy Bypass -File .\controller\release.ps1
 
 ### API key rejected 或突然退出登录
 
-这是 Catpaw Token 失效或轮换。启用“自动获取 Catpaw Token”并重启网关；如果仍然失败，先重新登录 Catpaw，再重启网关。
+启用“自动获取 Catpaw Token”后，正常的 Token 轮换会由网关热更新，不需要重启，也不会把瞬时 401 返回给 Claude。若 Catpaw 已退出登录或新 Token 尚未生成，网关会返回临时 503，避免 Claude 将本地 Provider 判定为 API Key 失效；重新登录 Catpaw 后重试当前操作即可。
 
 如果问题只在 Clash 全局代理开启后出现，建议改用规则模式并让以下域名直连：
 

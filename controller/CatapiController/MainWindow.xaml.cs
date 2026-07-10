@@ -172,7 +172,9 @@ public partial class MainWindow : Window
         }
 
         var settings = CurrentSettings();
-        var session = await ReadCatpawSessionAsync(settings.GatewayPath);
+        var session = settings.AutoToken
+            ? await ReadCatpawSessionAsync(settings.GatewayPath)
+            : null;
         var tokenResolution = TokenResolver.Resolve(settings, session);
         settings = tokenResolution.Settings;
         if (tokenResolution.Synced)
@@ -597,6 +599,7 @@ public partial class MainWindow : Window
         info.Environment["CATPAW_ENCRYPT"] = "1";
         info.Environment["CATPAW_FORCE_STREAM"] = "1";
         info.Environment["CATPAW_NATIVE_AGENT"] = "1";
+        info.Environment["CATPAW_AUTO_REFRESH_TOKEN"] = settings.AutoToken ? "1" : "0";
         info.Environment["CATPAW_MODEL_TYPE"] = "2";
         info.Environment["CATPAW_DEBUG"] = "0";
         info.Environment["CATPAW_HEADERS"] = "{\"ide-type\":\"CatPaw IDE\",\"client-type\":\"CatPaw IDE\",\"ide-version\":\"2026.2.3\",\"plugin-id\":\"mt-idekit.mt-idekit-code\",\"plugin-version\":\"2026.2.2\",\"client-env\":\"LOCAL_IDE\",\"platform-info\":\"win32-x64\",\"UI-Version\":\"0.2.2\"}";
