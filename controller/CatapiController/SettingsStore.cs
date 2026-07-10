@@ -5,16 +5,29 @@ using System.IO;
 
 namespace CatapiController;
 
-internal sealed record ControllerSettings(string Token, string Tenant, string GatewayPath);
+internal sealed record ControllerSettings(
+    string Token,
+    string Tenant,
+    string GatewayPath,
+    bool AutoToken = false);
 
 internal sealed class SettingsStore
 {
-    private sealed record StoredSettings(string ProtectedToken, string Tenant, string GatewayPath);
+    private sealed record StoredSettings(
+        string ProtectedToken,
+        string Tenant,
+        string GatewayPath,
+        bool AutoToken = false);
 
-    public string FilePath { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Catapi",
-        "settings.json");
+    public string FilePath { get; }
+
+    public SettingsStore(string? filePath = null)
+    {
+        FilePath = filePath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Catapi",
+            "settings.json");
+    }
 
     public async Task<ControllerSettings?> LoadAsync()
     {
@@ -31,12 +44,16 @@ internal sealed class SettingsStore
 
         var protectedBytes = Convert.FromBase64String(stored.ProtectedToken);
         var tokenBytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
-        return new ControllerSettings(Encoding.UTF8.GetString(tokenBytes), stored.Tenant, stored.GatewayPath);
+        return new ControllerSettings(
+            Encoding.UTF8.GetString(tokenBytes),
+            stored.Tenant,
+            stored.GatewayPath,
+            stored.AutoToken);
     }
 
     public async Task SaveAsync(ControllerSettings settings)
     {
-        if (string.IsNullOrWhiteSpace(settings.Token)
+        if ((!settings.AutoToken && string.IsNullOrWhiteSpace(settings.Token))
             || string.IsNullOrWhiteSpace(settings.Tenant)
             || !Directory.Exists(settings.GatewayPath))
         {
@@ -48,7 +65,8 @@ internal sealed class SettingsStore
         var stored = new StoredSettings(
             Convert.ToBase64String(protectedBytes),
             settings.Tenant.Trim(),
-            settings.GatewayPath);
+            settings.GatewayPath,
+            settings.AutoToken);
 
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         var temporaryPath = FilePath + ".tmp";

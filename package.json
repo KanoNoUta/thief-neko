@@ -1,6 +1,6 @@
 {
   "name": "thief-neko",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local Catpaw gateway and Windows controller for Claude Code Desktop",
   "private": true,
   "license": "MIT",

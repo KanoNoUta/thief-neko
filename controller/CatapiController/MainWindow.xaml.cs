@@ -50,8 +50,9 @@ public partial class MainWindow : Window
             var settings = await _settingsStore.LoadAsync();
             if (settings is not null)
             {
-                TokenPasswordBox.Password = settings.Token;
+                SetTokenValue(settings.Token);
                 TenantTextBox.Text = settings.Tenant;
+                AutoTokenToggle.IsChecked = settings.AutoToken;
                 if (Directory.Exists(settings.GatewayPath))
                 {
                     _gatewayPath = settings.GatewayPath;
@@ -171,7 +172,20 @@ public partial class MainWindow : Window
         }
 
         var settings = CurrentSettings();
-        var userMis = await ReadUserMisAsync(settings.GatewayPath);
+        var session = await ReadCatpawSessionAsync(settings.GatewayPath);
+        var tokenResolution = TokenResolver.Resolve(settings, session);
+        settings = tokenResolution.Settings;
+        if (tokenResolution.Synced)
+        {
+            SetTokenValue(settings.Token);
+            await _settingsStore.SaveAsync(settings);
+            AddActivity("已自动同步 Catpaw Token");
+        }
+        else if (tokenResolution.UsedFallback)
+        {
+            AddActivity("自动获取失败，已使用手动 Token");
+        }
+
         var startInfo = new ProcessStartInfo("node")
         {
             WorkingDirectory = settings.GatewayPath,
@@ -181,7 +195,7 @@ public partial class MainWindow : Window
             RedirectStandardError = true,
         };
         startInfo.ArgumentList.Add("src/server.js");
-        ApplyGatewayEnvironment(startInfo, settings, userMis);
+        ApplyGatewayEnvironment(startInfo, settings, session?.UserMis ?? "");
 
         _gatewayProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         _gatewayProcess.OutputDataReceived += (_, e) => RecordProcessLine(e.Data);
@@ -568,7 +582,8 @@ public partial class MainWindow : Window
     private ControllerSettings CurrentSettings() => new(
         TokenPasswordBox.Password.Trim(),
         TenantTextBox.Text.Trim(),
-        _gatewayPath);
+        _gatewayPath,
+        AutoTokenToggle.IsChecked == true);
 
     private static void ApplyGatewayEnvironment(ProcessStartInfo info, ControllerSettings settings, string userMis)
     {
@@ -587,7 +602,7 @@ public partial class MainWindow : Window
         info.Environment["CATPAW_HEADERS"] = "{\"ide-type\":\"CatPaw IDE\",\"client-type\":\"CatPaw IDE\",\"ide-version\":\"2026.2.3\",\"plugin-id\":\"mt-idekit.mt-idekit-code\",\"plugin-version\":\"2026.2.2\",\"client-env\":\"LOCAL_IDE\",\"platform-info\":\"win32-x64\",\"UI-Version\":\"0.2.2\"}";
     }
 
-    private static async Task<string> ReadUserMisAsync(string gatewayPath)
+    private static async Task<CatpawSession?> ReadCatpawSessionAsync(string gatewayPath)
     {
         try
         {
@@ -603,12 +618,24 @@ public partial class MainWindow : Window
             var output = await process.StandardOutput.ReadToEndAsync();
             await process.WaitForExitAsync();
             using var document = JsonDocument.Parse(output);
-            return ReadString(document.RootElement, "userMis") ?? "";
+            var token = ReadString(document.RootElement, "token");
+            var userMis = ReadString(document.RootElement, "userMis");
+            return string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(userMis)
+                ? null
+                : new CatpawSession(token, userMis);
         }
         catch
         {
-            return "";
+            return null;
         }
+    }
+
+    private void SetTokenValue(string token)
+    {
+        _syncingToken = true;
+        TokenPasswordBox.Password = token;
+        TokenRevealBox.Text = token;
+        _syncingToken = false;
     }
 
     private static string LocateGatewayRoot()
