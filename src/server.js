@@ -121,7 +121,7 @@ async function handleMessages(req, res, config, limits, agentSessions, metrics) 
     workspaceContext,
   });
   const clientWantsStream = openAIRequest.stream;
-  const useNativeAgent = config.nativeAgent && openAIRequest.tools?.length > 0;
+  const useNativeAgent = config.nativeAgent;
   const agentSession = useNativeAgent ? agentSessions.get(openAIRequest) : null;
   if (agentSession && workspaceContext) {
     agentSession.workspaceContext = workspaceContext;

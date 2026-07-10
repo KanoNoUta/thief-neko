@@ -112,6 +112,52 @@ test('gateway uses Catpaw native Agent protocol for a complete Claude tool loop'
   assert.equal(toolMessage.suggestUuid, 'suggest-1');
 });
 
+test('gateway uses Catpaw native Agent protocol for tool-free auxiliary requests', async (t) => {
+  let upstreamRequest;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamRequest = await readJson(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify({
+      id: 'chatcmpl-auxiliary',
+      content: 'AUXILIARY_OK',
+      choices: [{ delta: { content: 'AUXILIARY_OK' }, finishReason: 'stop' }],
+      lastOne: true,
+      statusCode: 0,
+    })}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createGatewayServer({
+    upstreamUrl: `http://127.0.0.1:${upstream.address().port}/api/gpt/openai/stream`,
+    model: 'glm-5.2',
+    forceStream: true,
+    nativeAgent: true,
+    userModelTypeCode: 2,
+    encrypt: false,
+    debug: false,
+    extraHeaders: {},
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(`http://127.0.0.1:${gateway.address().port}/v1/messages`, {
+    model: 'claude-fable-5',
+    stream: true,
+    system: 'Summarize the conversation.',
+    messages: [{ role: 'user', content: 'Summarize now.' }],
+  });
+
+  assert.match(response, /AUXILIARY_OK/);
+  assert.equal(upstreamRequest.triggerMode, 'AGENT');
+  assert.equal(upstreamRequest.userModelTypeCode, 2);
+  assert.equal(upstreamRequest.agentModeConfig.systemPrompt, 'Summarize the conversation.');
+  assert.deepEqual(
+    upstreamRequest.agentModeConfig.tools.find((tool) => tool.toolUseName === 'use_mcp_tool'),
+    { toolUseName: 'use_mcp_tool', enable: true, mcpTools: [] },
+  );
+});
+
 test('gateway injects Claude Desktop workspace mounts and rewrites native file tool paths', async (t) => {
   const claudeSessionRoot = await createClaudeSessionRoot(t);
   const upstreamRequests = [];
