@@ -1,6 +1,7 @@
 # Local agent and planning state
 .agents/
 .superpowers/
+.worktrees/
 docs/superpowers/
 
 # Runtime data and diagnostics
