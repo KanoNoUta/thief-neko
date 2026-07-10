@@ -1,0 +1,35 @@
+# Local agent and planning state
+.agents/
+.superpowers/
+docs/superpowers/
+
+# Runtime data and diagnostics
+logs/
+*.log
+*.stderr
+*.stdout
+
+# .NET build and publish output
+controller/**/bin/
+controller/**/obj/
+controller/publish/
+controller/release/
+controller/*-preview.png
+controller/controller-preview.png
+controller/date-clarity-preview.png
+controller/usage-history-preview.png
+
+# Release staging
+dist/
+
+# Local credentials and settings
+settings.json
+usage.json
+.env
+.env.*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

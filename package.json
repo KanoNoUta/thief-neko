@@ -1,0 +1,19 @@
+{
+  "name": "thief-neko",
+  "version": "0.1.0",
+  "description": "Local Catpaw gateway and Windows controller for Claude Code Desktop",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KanoNoUta/thief-neko.git"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

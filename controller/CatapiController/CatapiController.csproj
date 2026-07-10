@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>ThiefNeko</AssemblyName>
+    <Product>Thief Neko</Product>
+    <Description>Local Catpaw gateway controller for Claude Code Desktop</Description>
+    <Version>0.1.0</Version>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+</Project>
