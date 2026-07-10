@@ -34,7 +34,7 @@ Release 中的 `ThiefNeko.exe` 已包含 .NET 运行时，不需要另外安装 
 
 ## 安装和启动
 
-1. 从 GitHub Releases 下载 `Thief-Neko-v0.1.1-win-x64.zip`。
+1. 从 GitHub Releases 下载 `Thief-Neko-v0.1.2-win-x64.zip`。
 2. 完整解压，不能只把 EXE 单独拿出来；程序需要同目录中的 `src`。
 3. 确认 Catpaw 已登录。
 4. 双击 `ThiefNeko.exe`。
