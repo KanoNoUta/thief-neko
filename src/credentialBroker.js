@@ -54,17 +54,13 @@ export class CredentialBroker {
     return !snapshotsEqual(before, this.cachedCurrent);
   }
 
-  async refreshAfterUnauthorized(usedToken) {
+  refreshAfterUnauthorized(usedToken) {
     if (this.cachedCurrent.token !== usedToken) {
-      return true;
+      return Promise.resolve(true);
     }
     const active = this.refreshes.get(usedToken);
     if (active) {
-      await active;
-      if (this.cachedCurrent.token !== usedToken) {
-        return true;
-      }
-      return this.#getOrStartRefresh(usedToken);
+      return active;
     }
 
     return this.#getOrStartRefresh(usedToken);

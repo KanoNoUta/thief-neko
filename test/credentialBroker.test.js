@@ -116,7 +116,7 @@ test('CredentialBroker coalesces refreshes and skips them after the current toke
   assert.equal(refreshRequests, 1);
 });
 
-test('CredentialBroker retries for a joiner when the shared refresh leaves its token current', async () => {
+test('CredentialBroker returns one unchanged outcome to same-token concurrent callers', async () => {
   let releaseFirst;
   let refreshRequests = 0;
   const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });
@@ -132,9 +132,12 @@ test('CredentialBroker retries for a joiner when the shared refresh leaves its t
 
   const owner = broker.refreshAfterUnauthorized(TOKEN);
   const joiner = broker.refreshAfterUnauthorized(TOKEN);
+  assert.equal(joiner, owner);
   releaseFirst(okSnapshot(TOKEN, 1));
 
-  assert.deepEqual(await Promise.all([owner, joiner]), [false, true]);
+  assert.deepEqual(await Promise.all([owner, joiner]), [false, false]);
+  assert.equal(refreshRequests, 1);
+  assert.equal(await broker.refreshAfterUnauthorized(TOKEN), true);
   assert.equal(refreshRequests, 2);
 });
 

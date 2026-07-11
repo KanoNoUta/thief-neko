@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Cryptography;
@@ -9,6 +10,8 @@ namespace CatapiController;
 internal sealed class CredentialPipeServer : IAsyncDisposable
 {
     internal const int MaxMessageBytes = CredentialPipeFrameCodec.MaxPayloadBytes;
+    internal const PipeOptions ListenerOptions =
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
 
     private readonly CatpawAuthService _authService;
     private readonly CredentialPipeFrameCodec _frameCodec = new();
@@ -125,7 +128,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         PipeDirection.InOut,
         NamedPipeServerStream.MaxAllowedServerInstances,
         PipeTransmissionMode.Byte,
-        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        ListenerOptions);
 
     private async Task ObserveConnectionAsync(Task connection)
     {
@@ -195,7 +198,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
                 !TryGetString(root, "nonce", out var nonce) ||
-                !NonceMatches(nonce))
+                !NonceMatches(Nonce, nonce))
             {
                 return Error("unauthorized");
             }
@@ -269,12 +272,42 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         error = code,
     };
 
-    private bool NonceMatches(string candidate)
+    internal static bool NonceMatches(
+        string expected,
+        string candidate,
+        ArrayPool<byte>? pool = null)
     {
-        var expected = Encoding.ASCII.GetBytes(Nonce);
-        var actual = Encoding.ASCII.GetBytes(candidate);
-        return expected.Length == actual.Length &&
-            CryptographicOperations.FixedTimeEquals(expected, actual);
+        pool ??= ArrayPool<byte>.Shared;
+        var expectedLength = Encoding.ASCII.GetByteCount(expected);
+        var actualLength = Encoding.ASCII.GetByteCount(candidate);
+        var expectedBytes = pool.Rent(expectedLength);
+        var actualBytes = pool.Rent(actualLength);
+        try
+        {
+            Encoding.ASCII.GetBytes(
+                expected.AsSpan(),
+                expectedBytes.AsSpan(0, expectedLength));
+            Encoding.ASCII.GetBytes(
+                candidate.AsSpan(),
+                actualBytes.AsSpan(0, actualLength));
+            return expectedLength == actualLength &&
+                CryptographicOperations.FixedTimeEquals(
+                    expectedBytes.AsSpan(0, expectedLength),
+                    actualBytes.AsSpan(0, actualLength));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(expectedBytes.AsSpan());
+            CryptographicOperations.ZeroMemory(actualBytes.AsSpan());
+            try
+            {
+                pool.Return(expectedBytes);
+            }
+            finally
+            {
+                pool.Return(actualBytes);
+            }
+        }
     }
 
     private static bool TryGetString(JsonElement root, string name, out string value)

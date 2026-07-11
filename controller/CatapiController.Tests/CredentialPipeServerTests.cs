@@ -1,5 +1,6 @@
 using System.IO.Pipes;
 using System.Buffers;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using CatapiController;
@@ -28,6 +29,14 @@ internal static class CredentialPipeServerTests
             FrameCodecHandlesFragmentsAndLimitsAsync);
         yield return ("credential pipe frame codec clears temporary buffers",
             FrameCodecClearsTemporaryBuffersAsync);
+        yield return ("credential pipe nonce comparison clears temporary buffers",
+            NonceComparisonClearsTemporaryBuffersAsync);
+        yield return ("credential pipe listener is asynchronous and current-user only",
+            ListenerOptionsAreRestrictedAsync);
+        yield return ("credential pipe operation timeout is bounded",
+            OperationTimeoutIsBoundedAsync);
+        yield return ("credential pipe interoperates with the Node broker on Windows",
+            NodeBrokerIntegrationAsync);
         yield return ("credential pipe start waits for its first listener",
             StartWaitsForFirstListenerAsync);
         yield return ("credential pipe startup factory failures propagate immediately",
@@ -201,6 +210,124 @@ internal static class CredentialPipeServerTests
             "MemoryStream backing data should be zeroed before disposal");
     }
 
+    private static Task NonceComparisonClearsTemporaryBuffersAsync()
+    {
+        var pool = new TrackingArrayPool();
+
+        var matches = CredentialPipeServer.NonceMatches(
+            "expected-nonce-secret",
+            "different-nonce-secret",
+            pool);
+
+        AuthTestSupport.AssertTrue(!matches, "different nonces should not match");
+        AuthTestSupport.AssertEqual(2, pool.ReturnCalls,
+            "both temporary nonce arrays should be returned");
+        AuthTestSupport.AssertTrue(pool.WasZeroedOnReturn,
+            "both temporary nonce arrays should be zeroed before return");
+        return Task.CompletedTask;
+    }
+
+    private static Task ListenerOptionsAreRestrictedAsync()
+    {
+        AuthTestSupport.AssertTrue(
+            CredentialPipeServer.ListenerOptions.HasFlag(PipeOptions.Asynchronous),
+            "default listener should use asynchronous I/O");
+        AuthTestSupport.AssertTrue(
+            CredentialPipeServer.ListenerOptions.HasFlag(PipeOptions.CurrentUserOnly),
+            "default listener should reject clients from other Windows users");
+        return Task.CompletedTask;
+    }
+
+    private static async Task OperationTimeoutIsBoundedAsync()
+    {
+        await using var fixture = await Fixture.CreateAsync(
+            serverFactory: service => new CredentialPipeServer(
+                service,
+                TimeSpan.FromMilliseconds(50)));
+        await using var client = new NamedPipeClientStream(
+            ".", fixture.Server.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await client.ConnectAsync(cancellation.Token);
+        using var reader = new StreamReader(client, Encoding.UTF8, leaveOpen: true);
+
+        var raw = await reader.ReadLineAsync(cancellation.Token)
+            ?? throw new InvalidOperationException("timed out request returned no response");
+
+        using var response = JsonDocument.Parse(raw);
+        AssertError(response, "timeout");
+    }
+
+    private static async Task NodeBrokerIntegrationAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("SKIP real credential pipe integration requires Windows.");
+            return;
+        }
+        if (!await NodeIsAvailableAsync())
+        {
+            Console.WriteLine("SKIP real credential pipe integration requires Node.js.");
+            return;
+        }
+
+        var modulePath = FindWorkspaceFile(Path.Combine("src", "credentialBroker.js"))
+            ?? throw new InvalidOperationException("credentialBroker.js was not found");
+        await using var fixture = await Fixture.CreateAsync(
+            serverFactory: service => new CredentialPipeServer(
+                service,
+                TimeSpan.FromSeconds(2)));
+        var script = """
+            const { CredentialBroker } = await import(process.env.BROKER_MODULE);
+            const broker = new CredentialBroker({
+              pipeName: process.env.BROKER_PIPE,
+              nonce: process.env.BROKER_NONCE,
+            });
+            process.stdout.write(JSON.stringify(await broker.snapshot()));
+            """;
+        var startInfo = new ProcessStartInfo("node")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("--input-type=module");
+        startInfo.ArgumentList.Add("--eval");
+        startInfo.ArgumentList.Add(script);
+        startInfo.Environment["BROKER_MODULE"] = new Uri(modulePath).AbsoluteUri;
+        startInfo.Environment["BROKER_PIPE"] = fixture.Server.PipeName;
+        startInfo.Environment["BROKER_NONCE"] = fixture.Server.Nonce;
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Node integration process did not start");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch
+        {
+            TryKill(process);
+            throw;
+        }
+
+        var raw = await stdout;
+        await stderr;
+        AuthTestSupport.AssertEqual(0, process.ExitCode,
+            "Node credential broker integration should exit successfully");
+        using var snapshot = JsonDocument.Parse(raw);
+        AuthTestSupport.AssertEqual(fixture.Session.AccessToken,
+            snapshot.RootElement.GetProperty("token").GetString(),
+            "Node broker should receive the live C# access token");
+        AuthTestSupport.AssertEqual(fixture.Session.UserId,
+            snapshot.RootElement.GetProperty("userMis").GetString(),
+            "Node broker should receive the live C# user ID");
+        AuthTestSupport.AssertTrue(
+            snapshot.RootElement.GetProperty("generation").GetInt64() > 0,
+            "Node broker should receive a positive generation");
+    }
+
     private static async Task StartWaitsForFirstListenerAsync()
     {
         await using var fixture = await Fixture.CreateAsync(
@@ -310,6 +437,67 @@ internal static class CredentialPipeServerTests
         NamedPipeServerStream.MaxAllowedServerInstances,
         PipeTransmissionMode.Byte,
         PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+
+    private static async Task<bool> NodeIsAvailableAsync()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo("node")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add("--version");
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await process.WaitForExitAsync(timeout.Token);
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? FindWorkspaceFile(string relativePath)
+    {
+        foreach (var start in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
+        {
+            for (var directory = new DirectoryInfo(start);
+                directory is not null;
+                directory = directory.Parent)
+            {
+                var candidate = Path.Combine(directory.FullName, relativePath);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+        }
+    }
 
     private static async Task<string> SendAsync(
         string pipeName,
@@ -501,7 +689,8 @@ internal static class CredentialPipeServerTests
 
     private sealed class TrackingArrayPool : ArrayPool<byte>
     {
-        public bool WasZeroedOnReturn { get; private set; }
+        public bool WasZeroedOnReturn { get; private set; } = true;
+        public int ReturnCalls { get; private set; }
 
         public override byte[] Rent(int minimumLength)
         {
@@ -512,7 +701,8 @@ internal static class CredentialPipeServerTests
 
         public override void Return(byte[] array, bool clearArray = false)
         {
-            WasZeroedOnReturn = array.All(value => value == 0);
+            ReturnCalls++;
+            WasZeroedOnReturn &= array.All(value => value == 0);
         }
     }
 
