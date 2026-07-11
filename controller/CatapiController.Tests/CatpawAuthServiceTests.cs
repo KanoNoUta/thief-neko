@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using CatapiController;
 using static CatapiController.Tests.AuthTestSupport;
 
@@ -26,6 +27,14 @@ internal static class CatpawAuthServiceTests
             SchedulesBeforeExpiryWithoutOverlapAsync);
         yield return ("Catpaw auth service uses conservative schedule without expiry",
             SchedulesConservativelyWithoutExpiryAsync);
+        yield return ("Catpaw auth service backs off after scheduled retries are exhausted",
+            ScheduledFailureUsesRetryFloorAsync);
+        yield return ("Catpaw auth service escalates concurrent no-op to forced refresh",
+            ForcedRefreshEscalatesConcurrentNoOpAsync);
+        yield return ("Catpaw auth service persists refresh before publication",
+            RefreshPersistsBeforePublicationAsync);
+        yield return ("Catpaw auth service status and errors redact credentials",
+            StatusAndErrorsRedactCredentialsAsync);
     }
 
     private static async Task ConcurrentRefreshPersistsBothTokensAsync()
@@ -285,13 +294,187 @@ internal static class CatpawAuthServiceTests
         await service.StopAsync(default);
     }
 
+    private static async Task ScheduledFailureUsesRetryFloorAsync()
+    {
+        using var directory = new AuthTemporaryDirectory();
+        var delays = new List<TimeSpan>();
+        var failureFloor = new TaskCompletionSource<TimeSpan>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeAuthClient
+        {
+            Refresh = (_, _) => throw new CatpawAuthException(
+                "redacted transient failure", CatpawAuthFailureKind.Transient),
+        };
+        await using var service = Service(
+            client,
+            new AuthSessionStore(Path.Combine(directory.Path, "session.json")),
+            delay: (duration, ct) =>
+            {
+                lock (delays)
+                {
+                    delays.Add(duration);
+                    if (delays.Count == 5)
+                    {
+                        failureFloor.TrySetResult(duration);
+                        return Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                    }
+                }
+
+                return Task.CompletedTask;
+            },
+            timeProvider: new FixedTimeProvider(DateTimeOffset.Parse("2026-07-11T10:00:00Z")));
+        await service.SaveLoginAsync(Session("expired-access", "retained-refresh") with
+        {
+            AccessExpiresAt = DateTimeOffset.Parse("2026-07-11T09:00:00Z"),
+        }, default);
+
+        await service.StartAsync(default);
+
+        AssertEqual(TimeSpan.FromMinutes(5),
+            await failureFloor.Task.WaitAsync(TimeSpan.FromSeconds(1)),
+            "exhausted scheduled refresh should apply a five-minute retry floor");
+        AssertEqual(4, client.RefreshCalls,
+            "scheduler should stop issuing refreshes while failure floor is pending");
+        lock (delays)
+        {
+            AssertSequenceEqual(
+                new[]
+                {
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(1),
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5),
+                    TimeSpan.FromMinutes(5),
+                },
+                delays,
+                "scheduler delay sequence should be bounded after transient exhaustion");
+        }
+        await service.StopAsync(default);
+    }
+
+    private static async Task ForcedRefreshEscalatesConcurrentNoOpAsync()
+    {
+        using var directory = new AuthTemporaryDirectory();
+        var loadEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseLoad = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var current = Session("current-access", "current-refresh") with
+        {
+            AccessExpiresAt = DateTimeOffset.Parse("2026-07-11T12:00:00Z"),
+        };
+        var rotated = Session("forced-access", "forced-refresh");
+        var client = new FakeAuthClient
+        {
+            Refresh = (_, _) => Task.FromResult(rotated),
+        };
+        await using var service = Service(
+            client,
+            new AuthSessionStore(Path.Combine(directory.Path, "session.json")),
+            timeProvider: new FixedTimeProvider(DateTimeOffset.Parse("2026-07-11T10:00:00Z")),
+            loadSession: async ct =>
+            {
+                loadEntered.TrySetResult();
+                await releaseLoad.Task.WaitAsync(ct);
+                return current;
+            });
+
+        var nonForced = service.RefreshAsync(false, default);
+        await loadEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var forced = service.RefreshAsync(true, default);
+        releaseLoad.SetResult();
+
+        AssertEqual(current, await nonForced,
+            "non-forced operation should retain a session that is not due");
+        AssertEqual(rotated, await forced,
+            "forced caller should receive a genuinely refreshed session");
+        AssertEqual(1, client.RefreshCalls,
+            "forced caller should invoke client after concurrent no-op completes");
+    }
+
+    private static async Task RefreshPersistsBeforePublicationAsync()
+    {
+        using var directory = new AuthTemporaryDirectory();
+        var store = new AuthSessionStore(Path.Combine(directory.Path, "session.json"));
+        var oldSession = Session("old-visible-access", "old-visible-refresh");
+        var newSession = Session("new-hidden-access", "new-hidden-refresh");
+        var saveEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSave = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeAuthClient
+        {
+            Refresh = (_, _) => Task.FromResult(newSession),
+        };
+        await using var service = Service(
+            client,
+            store,
+            saveSession: async (session, ct) =>
+            {
+                if (session.AccessToken == newSession.AccessToken)
+                {
+                    saveEntered.TrySetResult();
+                    await releaseSave.Task.WaitAsync(ct);
+                }
+
+                await store.SaveAsync(session, ct);
+            });
+        await service.SaveLoginAsync(oldSession, default);
+
+        var refresh = service.RefreshAsync(true, default);
+        await saveEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        AssertEqual(oldSession, await service.GetSessionAsync(default),
+            "unpersisted refresh must not be visible through service snapshot");
+        releaseSave.SetResult();
+        AssertEqual(newSession, await refresh,
+            "refresh caller should receive session after persistence completes");
+        AssertEqual(newSession, await service.GetSessionAsync(default),
+            "persisted refresh should become visible through service snapshot");
+    }
+
+    private static async Task StatusAndErrorsRedactCredentialsAsync()
+    {
+        const string accessToken = "status-access-token-secret";
+        const string refreshToken = "status-refresh-token-secret";
+        using var directory = new AuthTemporaryDirectory();
+        var client = new FakeAuthClient
+        {
+            Refresh = (_, _) => throw new CatpawAuthException(
+                $"rejected {accessToken} using {refreshToken}",
+                CatpawAuthFailureKind.AuthRejected),
+        };
+        await using var service = Service(
+            client,
+            new AuthSessionStore(Path.Combine(directory.Path, "session.json")));
+        await service.SaveLoginAsync(Session(accessToken, refreshToken), default);
+
+        var error = await AssertThrowsAsync<CatpawAuthException>(
+            () => service.RefreshAsync(true, default),
+            "rejected refresh should expose a redacted service error");
+        var status = service.GetStatus();
+        var visibleText = string.Join(
+            Environment.NewLine,
+            JsonSerializer.Serialize(status),
+            status.ToString(),
+            error.ToString());
+
+        AssertTrue(!visibleText.Contains(accessToken, StringComparison.Ordinal),
+            "service-visible status and errors must redact access token");
+        AssertTrue(!visibleText.Contains(refreshToken, StringComparison.Ordinal),
+            "service-visible status and errors must redact refresh token");
+    }
+
     private static CatpawAuthService Service(
         ICatpawAuthClient client,
         AuthSessionStore store,
         Func<string, CancellationToken, Task<string>>? desktopStateReader = null,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
-        TimeProvider? timeProvider = null) => new(
-            client, store, Tenant, desktopStateReader, delay, timeProvider);
+        TimeProvider? timeProvider = null,
+        Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
+        Func<AuthSession, CancellationToken, Task>? saveSession = null) => new(
+            client, store, Tenant, desktopStateReader, delay, timeProvider,
+            loadSession, saveSession);
 
     private static AuthSession Session(string accessToken, string refreshToken) => new(
         accessToken,

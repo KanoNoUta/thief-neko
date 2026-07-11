@@ -15,14 +15,16 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         TimeSpan.FromSeconds(5),
     };
     private static readonly TimeSpan ImportTimeout = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan SchedulerFailureDelay = TimeSpan.FromMinutes(5);
     private const int MaxImportOutputCharacters = 64 * 1024;
 
     private readonly ICatpawAuthClient _client;
-    private readonly AuthSessionStore _store;
     private readonly string _tenant;
     private readonly Func<string, CancellationToken, Task<string>> _desktopStateReader;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _timeProvider;
+    private readonly Func<CancellationToken, Task<AuthSession?>> _loadSession;
+    private readonly Func<AuthSession, CancellationToken, Task> _saveSession;
     private readonly object _sync = new();
     private readonly CancellationTokenSource _lifetimeCancellation = new();
 
@@ -30,6 +32,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     private bool _loaded;
     private AuthStatus _status = new(false, string.Empty, "LoginRequired");
     private Task<AuthSession>? _refreshTask;
+    private bool _refreshTaskForced;
     private CancellationTokenSource? _schedulerCancellation;
     private Task? _schedulerTask;
     private bool _disposed;
@@ -40,14 +43,18 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         string tenant,
         Func<string, CancellationToken, Task<string>>? desktopStateReader = null,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
+        Func<AuthSession, CancellationToken, Task>? saveSession = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
-        _store = store ?? throw new ArgumentNullException(nameof(store));
+        ArgumentNullException.ThrowIfNull(store);
         _tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
         _desktopStateReader = desktopStateReader ?? ReadDesktopStateAsync;
         _delay = delay ?? Task.Delay;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _loadSession = loadSession ?? store.LoadAsync;
+        _saveSession = saveSession ?? store.SaveAsync;
     }
 
     public async Task<AuthSession?> GetSessionAsync(CancellationToken ct = default)
@@ -61,7 +68,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             }
         }
 
-        var loaded = await _store.LoadAsync(ct);
+        var loaded = await _loadSession(ct);
         lock (_sync)
         {
             if (!_loaded)
@@ -109,24 +116,32 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     public Task<AuthSession> RefreshAsync(bool force, CancellationToken ct)
     {
         Task<AuthSession> refresh;
+        var escalateAfterCurrent = false;
         lock (_sync)
         {
             ThrowIfDisposed();
             if (_refreshTask is null || _refreshTask.IsCompleted)
             {
                 _refreshTask = RefreshCoreAsync(force, _lifetimeCancellation.Token);
+                _refreshTaskForced = force;
+            }
+            else if (force && !_refreshTaskForced)
+            {
+                escalateAfterCurrent = true;
             }
 
             refresh = _refreshTask;
         }
 
-        return refresh.WaitAsync(ct);
+        return escalateAfterCurrent
+            ? RefreshAfterAsync(refresh, ct)
+            : refresh.WaitAsync(ct);
     }
 
     public async Task SaveLoginAsync(AuthSession session, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(session);
-        await _store.SaveAsync(session, ct);
+        await _saveSession(session, ct);
         lock (_sync)
         {
             ThrowIfDisposed();
@@ -224,7 +239,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             try
             {
                 var refreshed = await _client.RefreshAsync(current, ct);
-                await _store.SaveAsync(refreshed, ct);
+                await _saveSession(refreshed, ct);
                 lock (_sync)
                 {
                     _session = refreshed;
@@ -242,7 +257,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
                     _status = new AuthStatus(false, current.AccountLabel, "LoginRequired");
                 }
 
-                throw;
+                throw RedactedRefreshFailure(error.Kind);
             }
             catch (Exception error) when (IsTransient(error) && attempt < RetryDelays.Length)
             {
@@ -260,9 +275,21 @@ internal sealed class CatpawAuthService : IAsyncDisposable
                     _status = new AuthStatus(true, current.AccountLabel, "RefreshPending");
                 }
 
-                throw;
+                throw RedactedRefreshFailure(CatpawAuthFailureKind.Transient);
+            }
+            catch (CatpawAuthException error)
+            {
+                throw RedactedRefreshFailure(error.Kind);
             }
         }
+    }
+
+    private async Task<AuthSession> RefreshAfterAsync(
+        Task<AuthSession> current,
+        CancellationToken ct)
+    {
+        await current.WaitAsync(ct);
+        return await RefreshAsync(true, ct);
     }
 
     private async Task RunSchedulerAsync(CancellationToken ct)
@@ -288,6 +315,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             }
             catch (Exception error) when (IsTransient(error))
             {
+                await _delay(SchedulerFailureDelay, ct);
             }
         }
     }
@@ -343,6 +371,10 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         {
             Kind: CatpawAuthFailureKind.Transient,
         };
+
+    private static CatpawAuthException RedactedRefreshFailure(
+        CatpawAuthFailureKind kind) =>
+        new("Catpaw session refresh failed.", kind);
 
     private static async Task<string> ReadDesktopStateAsync(
         string gatewayPath,
