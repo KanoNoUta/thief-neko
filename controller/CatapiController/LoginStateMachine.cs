@@ -19,9 +19,10 @@ internal enum LoginPhase
     MobileEntry,
     SendingSms,
     YodaChallenge,
-    WaitingForSmsCode,
+    CodeEntry,
     VerifyingSms,
     NeedsInvitation,
+    ReadyToLogin,
     SigningIn,
     SignedIn,
     Expired,
@@ -51,7 +52,7 @@ internal sealed partial class LoginStateMachine : IDisposable
     public bool IsBinding => _binding;
     public bool CanSendSms => !_disposed && _termsAccepted && _mobileValid &&
         CountdownSeconds == 0 && Phase is LoginPhase.MobileEntry or
-            LoginPhase.NeedsMobileBinding or LoginPhase.WaitingForSmsCode;
+            LoginPhase.NeedsMobileBinding or LoginPhase.CodeEntry;
     public CancellationToken ActiveToken => _activeOperation?.Token ?? CancellationToken.None;
 
     public CancellationToken BeginQrRequest()
@@ -164,7 +165,9 @@ internal sealed partial class LoginStateMachine : IDisposable
     {
         ThrowIfDisposed();
         _mobileValid = IsValidChineseMobile(mobile);
-        if (!_termsAccepted || !_mobileValid || CountdownSeconds > 0)
+        if (Phase is not (LoginPhase.MobileEntry or LoginPhase.NeedsMobileBinding or
+                LoginPhase.CodeEntry) ||
+            !_termsAccepted || !_mobileValid || CountdownSeconds > 0)
         {
             throw new InvalidOperationException("Mobile and terms must be valid before requesting SMS.");
         }
@@ -192,7 +195,7 @@ internal sealed partial class LoginStateMachine : IDisposable
 
         CancelActiveOperation();
         CountdownSeconds = 60;
-        Phase = LoginPhase.WaitingForSmsCode;
+        Phase = LoginPhase.CodeEntry;
     }
 
     public void TickCountdown(int seconds = 1)
@@ -209,7 +212,8 @@ internal sealed partial class LoginStateMachine : IDisposable
     public CancellationToken BeginVerification(string mobile, string smsCode)
     {
         ThrowIfDisposed();
-        if (!IsValidChineseMobile(mobile) || !IsValidSmsCode(smsCode))
+        if (Phase != LoginPhase.CodeEntry ||
+            !IsValidChineseMobile(mobile) || !IsValidSmsCode(smsCode))
         {
             throw new InvalidOperationException("Mobile verification input is invalid.");
         }
@@ -222,21 +226,31 @@ internal sealed partial class LoginStateMachine : IDisposable
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(verification);
+        if (Phase != LoginPhase.VerifyingSms)
+        {
+            throw new InvalidOperationException("SMS verification is not active.");
+        }
+
         CancelActiveOperation();
         if (!verification.Verified)
         {
-            Phase = LoginPhase.WaitingForSmsCode;
+            Phase = LoginPhase.CodeEntry;
             return;
         }
 
         Phase = verification.InvitationCodeRequired
             ? LoginPhase.NeedsInvitation
-            : LoginPhase.SigningIn;
+            : LoginPhase.ReadyToLogin;
     }
 
     public CancellationToken BeginLogin(string? invitation)
     {
         ThrowIfDisposed();
+        if (Phase is not (LoginPhase.NeedsInvitation or LoginPhase.ReadyToLogin))
+        {
+            throw new InvalidOperationException("Successful SMS verification is required.");
+        }
+
         if (Phase == LoginPhase.NeedsInvitation && !IsValidInvitation(invitation))
         {
             throw new InvalidOperationException("Invitation code is invalid.");

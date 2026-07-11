@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.IO;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -14,36 +15,48 @@ public partial class YodaChallengeWindow : Window
     private readonly string _userDataFolder = Path.Combine(
         Path.GetTempPath(),
         $"thief-neko-yoda-{Guid.NewGuid():N}");
+    private readonly YodaChallengeLifecycle _lifecycle;
+    private bool _closeRequested;
+    private bool _closeReady;
 
     internal YodaChallengeWindow(string requestCode)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(requestCode);
         _requestCode = requestCode;
         InitializeComponent();
-        Loaded += async (_, _) => await InitializeChallengeAsync();
+        _lifecycle = new YodaChallengeLifecycle(
+            InitializeChallengeAsync,
+            DisposeWebView,
+            CleanupProfileAsync);
+        Loaded += async (_, _) =>
+        {
+            try
+            {
+                await _lifecycle.StartAsync();
+            }
+            catch when (!_lifecycle.LifetimeToken.IsCancellationRequested)
+            {
+                ChallengeStatusText.Text = "验证加载失败 / Challenge failed to load";
+            }
+        };
     }
 
     internal bool ChallengeSucceeded { get; private set; }
 
-    private async Task InitializeChallengeAsync()
+    private async Task InitializeChallengeAsync(CancellationToken ct)
     {
-        try
-        {
-            var environment = await CoreWebView2Environment.CreateAsync(
-                userDataFolder: _userDataFolder);
-            await ChallengeWebView.EnsureCoreWebView2Async(environment);
-            ChallengeWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
-            ChallengeWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-            ChallengeWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            ChallengeWebView.CoreWebView2.WebMessageReceived += WebMessageReceived;
-            ChallengeWebView.CoreWebView2.NavigationStarting += NavigationStarting;
-            ChallengeWebView.NavigateToString(BuildChallengeHtml(_requestCode));
-            ChallengeStatusText.Text = "请完成验证 / Complete the challenge";
-        }
-        catch
-        {
-            ChallengeStatusText.Text = "验证加载失败 / Challenge failed to load";
-        }
+        var environment = await CoreWebView2Environment.CreateAsync(
+            userDataFolder: _userDataFolder);
+        ct.ThrowIfCancellationRequested();
+        await ChallengeWebView.EnsureCoreWebView2Async(environment);
+        ct.ThrowIfCancellationRequested();
+        ChallengeWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+        ChallengeWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+        ChallengeWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+        ChallengeWebView.CoreWebView2.WebMessageReceived += WebMessageReceived;
+        ChallengeWebView.CoreWebView2.NavigationStarting += NavigationStarting;
+        ChallengeWebView.NavigateToString(BuildChallengeHtml(_requestCode));
+        ChallengeStatusText.Text = "请完成验证 / Complete the challenge";
     }
 
     private static void NavigationStarting(
@@ -136,7 +149,7 @@ public partial class YodaChallengeWindow : Window
     private void Cancel_Click(object sender, RoutedEventArgs e)
     {
         ChallengeSucceeded = false;
-        DialogResult = false;
+        Close();
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -147,7 +160,33 @@ public partial class YodaChallengeWindow : Window
         }
     }
 
-    private async void Window_Closed(object? sender, EventArgs e)
+    private async void Window_Closing(object? sender, CancelEventArgs e)
+    {
+        if (_closeReady)
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        if (_closeRequested)
+        {
+            return;
+        }
+
+        _closeRequested = true;
+        try
+        {
+            await _lifecycle.CloseAsync();
+        }
+        finally
+        {
+            _requestCode = string.Empty;
+            _closeReady = true;
+            Close();
+        }
+    }
+
+    private void DisposeWebView()
     {
         if (ChallengeWebView.CoreWebView2 is not null)
         {
@@ -155,19 +194,23 @@ public partial class YodaChallengeWindow : Window
             ChallengeWebView.CoreWebView2.NavigationStarting -= NavigationStarting;
         }
 
-        _requestCode = string.Empty;
         ChallengeWebView.Dispose();
-        for (var attempt = 0; attempt < 5 && Directory.Exists(_userDataFolder); attempt++)
+    }
+
+    private async Task CleanupProfileAsync()
+    {
+        for (var attempt = 0; attempt < 40 && Directory.Exists(_userDataFolder); attempt++)
         {
             try
             {
+                NormalizeAttributes(_userDataFolder);
                 Directory.Delete(_userDataFolder, true);
             }
-            catch (IOException) when (attempt < 4)
+            catch (IOException) when (attempt < 39)
             {
                 await Task.Delay(50);
             }
-            catch (UnauthorizedAccessException) when (attempt < 4)
+            catch (UnauthorizedAccessException) when (attempt < 39)
             {
                 await Task.Delay(50);
             }
@@ -178,6 +221,24 @@ public partial class YodaChallengeWindow : Window
             catch (UnauthorizedAccessException)
             {
                 break;
+            }
+        }
+    }
+
+    private static void NormalizeAttributes(string directory)
+    {
+        foreach (var path in Directory.EnumerateFileSystemEntries(
+                     directory, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                File.SetAttributes(path, FileAttributes.Normal);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
     }

@@ -7,7 +7,7 @@
         WindowStartupLocation="CenterOwner" WindowStyle="None" ResizeMode="NoResize"
         ShowInTaskbar="False" Background="#171714"
         FontFamily="Segoe UI,Microsoft YaHei UI" Foreground="{StaticResource TextBrush}"
-        Closed="Window_Closed">
+        Closing="Window_Closing">
     <Border Margin="10" BorderBrush="#45443D" BorderThickness="1" CornerRadius="7"
             Background="{StaticResource WindowBackground}">
         <Grid>

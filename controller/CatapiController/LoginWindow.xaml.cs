@@ -12,6 +12,7 @@ public partial class LoginWindow : Window
     private readonly ICatpawLoginClient _client;
     private readonly CatpawAuthService _authService;
     private readonly LoginStateMachine _state = new();
+    private readonly LoginFlowController _flow;
     private readonly DispatcherTimer _countdownTimer = new()
     {
         Interval = TimeSpan.FromSeconds(1),
@@ -25,6 +26,8 @@ public partial class LoginWindow : Window
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _authService = authService ?? throw new ArgumentNullException(nameof(authService));
         InitializeComponent();
+        _flow = new LoginFlowController(
+            _state, _client, _authService.SaveLoginAsync, ClearMobileInputs);
         _countdownTimer.Tick += CountdownTimer_Tick;
         Loaded += async (_, _) => await BeginQrFlowAsync();
     }
@@ -72,19 +75,22 @@ public partial class LoginWindow : Window
             while (!token.IsCancellationRequested &&
                    _state.QrExpiresAt is { } expiresAt && DateTimeOffset.UtcNow < expiresAt)
             {
-                var challengeCode = GetActiveQrCode();
-                var result = await _client.PollQrAsync(challengeCode, token);
-                _state.ApplyQrPoll(result);
+                var outcome = await _flow.PollQrOnceAsync(token);
                 RenderState();
-                if (_state.Phase == LoginPhase.NeedsMobileBinding)
+                if (outcome == QrPollOutcome.BindingRequired)
                 {
                     MobileModeRadio.IsChecked = true;
                     return;
                 }
 
-                if (result.Session is not null && _state.Phase == LoginPhase.SignedIn)
+                if (outcome == QrPollOutcome.SignedIn)
                 {
-                    await FinishSignInAsync(result.Session, token);
+                    DialogResult = true;
+                    return;
+                }
+
+                if (outcome == QrPollOutcome.Expired)
+                {
                     return;
                 }
 
@@ -110,12 +116,6 @@ public partial class LoginWindow : Window
                 RenderState();
             }
         }
-    }
-
-    private string GetActiveQrCode()
-    {
-        return _state.ActiveQrCode
-            ?? throw new InvalidOperationException("QR challenge is unavailable.");
     }
 
     private async void QrTerms_Changed(object sender, RoutedEventArgs e)
@@ -273,17 +273,43 @@ public partial class LoginWindow : Window
 
     private async void SubmitMobile_Click(object sender, RoutedEventArgs e)
     {
+        if (_state.Phase == LoginPhase.NeedsInvitation)
+        {
+            if (!LoginStateMachine.IsValidInvitation(InvitationTextBox.Text))
+            {
+                _statusOverride = "请检查邀请码 / Check invitation";
+                RenderState();
+                return;
+            }
+
+            try
+            {
+                var continuation = await _flow.ContinueInvitationAsync(
+                    InvitationTextBox.Text, default);
+                if (continuation == MobileSubmitOutcome.SignedIn)
+                {
+                    DialogResult = true;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch
+            {
+                _statusOverride = "登录失败，请重试 / Sign-in failed";
+                RenderState();
+            }
+
+            return;
+        }
+
         var mobile = MobileTextBox.Text;
         var smsCode = SmsCodeTextBox.Text;
-        var invitation = InvitationPanel.Visibility == Visibility.Visible
-            ? InvitationTextBox.Text
-            : null;
 
-        if (!LoginStateMachine.IsValidChineseMobile(mobile) ||
+        if (_state.Phase != LoginPhase.CodeEntry ||
+            !LoginStateMachine.IsValidChineseMobile(mobile) ||
             !LoginStateMachine.IsValidSmsCode(smsCode) ||
-            !_state.TermsAccepted ||
-            (_state.Phase == LoginPhase.NeedsInvitation &&
-             !LoginStateMachine.IsValidInvitation(invitation)))
+            !_state.TermsAccepted)
         {
             _statusOverride = "请检查输入 / Check the form";
             RenderState();
@@ -292,26 +318,22 @@ public partial class LoginWindow : Window
 
         try
         {
-            var token = _state.BeginVerification(mobile, smsCode);
+            var outcome = await _flow.SubmitMobileAsync(mobile, smsCode, default);
             RenderState();
-            var verification = await _client.VerifySmsAsync(mobile, smsCode, token);
-            _state.ApplyVerification(verification);
-            RenderState();
-            if (!verification.Verified)
+            if (outcome == MobileSubmitOutcome.InvalidCode)
             {
                 _statusOverride = "验证码无效 / Invalid SMS code";
                 RenderState();
                 return;
             }
 
-            if (verification.InvitationCodeRequired &&
-                !LoginStateMachine.IsValidInvitation(invitation))
+            if (outcome == MobileSubmitOutcome.InvitationRequired)
             {
                 InvitationTextBox.Focus();
                 return;
             }
 
-            await SubmitLoginAsync(mobile, smsCode, invitation);
+            DialogResult = true;
         }
         catch (OperationCanceledException)
         {
@@ -322,25 +344,6 @@ public partial class LoginWindow : Window
             _statusOverride = "登录失败，请重试 / Sign-in failed";
             RenderState();
         }
-    }
-
-    private async Task SubmitLoginAsync(string mobile, string smsCode, string? invitation)
-    {
-        var qrCode = _state.BindingQrCode;
-        var token = _state.BeginLogin(invitation);
-        RenderState();
-        var session = qrCode is null
-            ? await _client.LoginMobileAsync(mobile, smsCode, invitation, token)
-            : await _client.BindMobileAsync(qrCode, mobile, smsCode, invitation, token);
-        await FinishSignInAsync(session, token);
-    }
-
-    private async Task FinishSignInAsync(AuthSession session, CancellationToken token)
-    {
-        await _authService.SaveLoginAsync(session, token);
-        _state.CompleteSignIn();
-        ClearMobileInputs();
-        DialogResult = true;
     }
 
     private void CountdownTimer_Tick(object? sender, EventArgs e)
@@ -399,6 +402,7 @@ public partial class LoginWindow : Window
             ? Visibility.Visible
             : Visibility.Collapsed;
         SubmitMobileButton.IsEnabled =
+            (_state.Phase is LoginPhase.CodeEntry or LoginPhase.NeedsInvitation) &&
             LoginStateMachine.IsValidChineseMobile(MobileTextBox.Text) &&
             LoginStateMachine.IsValidSmsCode(SmsCodeTextBox.Text) &&
             _state.TermsAccepted &&
@@ -414,7 +418,7 @@ public partial class LoginWindow : Window
         {
             LoginPhase.SendingSms => "正在发送短信 / Sending SMS",
             LoginPhase.YodaChallenge => "安全验证 / Security challenge",
-            LoginPhase.WaitingForSmsCode => "验证码已发送 / SMS sent",
+            LoginPhase.CodeEntry => "验证码已发送 / SMS sent",
             LoginPhase.VerifyingSms => "正在验证 / Verifying",
             LoginPhase.NeedsInvitation => "需要六位大写邀请码 / Invitation required",
             LoginPhase.SigningIn => "正在登录 / Signing in",
@@ -456,7 +460,7 @@ public partial class LoginWindow : Window
     {
         _closing = true;
         _countdownTimer.Stop();
-        ClearMobileInputs();
+        _flow.Dispose();
         _state.Dispose();
         QrImage.Source = null;
     }
