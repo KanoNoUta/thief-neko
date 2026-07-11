@@ -123,8 +123,8 @@ internal static class CredentialPipeServerTests
 
         using var malformedResponse = JsonDocument.Parse(malformed);
         using var unknownResponse = JsonDocument.Parse(unknown);
-        AssertError(malformedResponse, "bad_request");
-        AssertError(unknownResponse, "unknown_operation");
+        AssertError(malformedResponse, "malformed");
+        AssertError(unknownResponse, "unknown");
         AssertSecretFree(malformed + unknown, fixture.Server.Nonce, fixture.Session);
         AuthTestSupport.AssertTrue(!unknown.Contains("steal-refresh-secret", StringComparison.Ordinal),
             "unknown operation must not be echoed");
@@ -137,7 +137,7 @@ internal static class CredentialPipeServerTests
             new string('x', CredentialPipeServer.MaxMessageBytes + 1) + "\n");
 
         using var response = JsonDocument.Parse(raw);
-        AssertError(response, "request_too_large");
+        AssertError(response, "oversize");
         AssertSecretFree(raw, fixture.Server.Nonce, fixture.Session);
     }
 
@@ -194,9 +194,11 @@ internal static class CredentialPipeServerTests
     {
         AuthTestSupport.AssertTrue(!response.RootElement.GetProperty("ok").GetBoolean(),
             "error response should set ok=false");
+        AuthTestSupport.AssertEqual(2, response.RootElement.EnumerateObject().Count(),
+            "error response should contain only ok and error");
         AuthTestSupport.AssertEqual(code,
-            response.RootElement.GetProperty("error").GetProperty("code").GetString(),
-            "error response should use the expected code");
+            response.RootElement.GetProperty("error").GetString(),
+            "error response should use an exact stable string code");
     }
 
     private static void AssertSecretFree(string raw, string secret, AuthSession session)

@@ -7,7 +7,7 @@ const PIPE_NAME = 'catapi-credential-test';
 const NONCE = 'nonce-secret-value';
 const TOKEN = 'access-token-secret';
 
-test('CredentialBroker polls one snapshot line and exposes the exact normalized snapshot', async () => {
+test('CredentialBroker requests one snapshot line and returns the exact normalized snapshot', async () => {
   const transport = fakeTransport(({ path, request }) => {
     assert.equal(path, `\\\\.\\pipe\\${PIPE_NAME}`);
     assert.deepEqual(request, { nonce: NONCE, operation: 'snapshot' });
@@ -15,15 +15,28 @@ test('CredentialBroker polls one snapshot line and exposes the exact normalized 
   });
   const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
 
-  assert.equal(await broker.poll(), true);
-  assert.deepEqual(broker.snapshot(), {
+  assert.deepEqual(await broker.snapshot(), {
     token: 'token-1',
     userMis: 'user-1',
     cookie: 'passport=token-1',
     generation: 7,
   });
   assert.equal(transport.sockets[0].written.endsWith('\n'), true);
-  assert.equal(transport.sockets[0].writableEnded, true);
+  assert.equal(transport.sockets[0].destroyCalls, 1);
+});
+
+test('CredentialBroker snapshot requests fresh state on every call', async () => {
+  let requests = 0;
+  const transport = fakeTransport(() => {
+    requests += 1;
+    return okSnapshot(`token-${requests}`, requests);
+  });
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  assert.equal((await broker.snapshot()).token, 'token-1');
+  assert.equal((await broker.snapshot()).token, 'token-2');
+  assert.equal(requests, 2);
+  assert.equal(transport.sockets.length, 2);
 });
 
 test('CredentialBroker refreshes after unauthorized with the token that was used', async () => {
@@ -35,7 +48,7 @@ test('CredentialBroker refreshes after unauthorized with the token that was used
       : okSnapshot('rotated-token', 4);
   });
   const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
-  await broker.poll();
+  await broker.snapshot();
 
   assert.equal(await broker.refreshAfterUnauthorized(TOKEN), true);
   assert.deepEqual(requests[1], {
@@ -43,7 +56,7 @@ test('CredentialBroker refreshes after unauthorized with the token that was used
     operation: 'refresh',
     usedToken: TOKEN,
   });
-  assert.equal(broker.snapshot().token, 'rotated-token');
+  assert.equal((await broker.snapshot()).token, 'rotated-token');
 });
 
 test('CredentialBroker coalesces refreshes and skips them after the current token changes', async () => {
@@ -57,7 +70,7 @@ test('CredentialBroker coalesces refreshes and skips them after the current toke
     return okSnapshot('new-token', 2);
   });
   const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
-  await broker.poll();
+  await broker.snapshot();
 
   const first = broker.refreshAfterUnauthorized(TOKEN);
   const second = broker.refreshAfterUnauthorized(TOKEN);
@@ -97,13 +110,29 @@ test('CredentialBroker rejects malformed responses without retaining raw content
 test('CredentialBroker redacts unauthorized server responses', async () => {
   const transport = fakeTransport(() => ({
     ok: false,
-    error: { code: 'unauthorized', message: `denied ${NONCE} ${TOKEN}` },
+    error: 'unauthorized',
   }));
   const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
 
   const error = await captureError(() => broker.poll());
   assert.equal(error.code, 'CREDENTIAL_BROKER_UNAUTHORIZED');
   assertSecretFree(error);
+});
+
+test('CredentialBroker maps stable server error strings without exposing raw content', async () => {
+  const cases = [
+    ['malformed', 'CREDENTIAL_BROKER_MALFORMED'],
+    ['oversize', 'CREDENTIAL_BROKER_OVERSIZE'],
+    ['unknown', 'CREDENTIAL_BROKER_REJECTED'],
+  ];
+
+  for (const [serverError, expectedCode] of cases) {
+    const transport = fakeTransport(() => ({ ok: false, error: serverError }));
+    const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+    const error = await captureError(() => broker.snapshot());
+    assert.equal(error.code, expectedCode);
+    assertSecretFree(error, JSON.stringify({ ok: false, error: serverError }));
+  }
 });
 
 test('CredentialBroker rejects oversized responses and destroys the socket', async () => {
@@ -114,6 +143,24 @@ test('CredentialBroker rejects oversized responses and destroys the socket', asy
   assert.equal(error.code, 'CREDENTIAL_BROKER_OVERSIZE');
   assert.equal(transport.sockets[0].destroyed, true);
   assertSecretFree(error);
+});
+
+test('CredentialBroker rejects oversized outbound frames before connecting', async () => {
+  const oversizedNonce = `outbound-secret-${'x'.repeat(16 * 1024)}`;
+  let connectCalls = 0;
+  const broker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: oversizedNonce,
+    connect: () => {
+      connectCalls += 1;
+      throw new Error('connector must not run');
+    },
+  });
+
+  const error = await captureError(() => broker.snapshot());
+  assert.equal(error.code, 'CREDENTIAL_BROKER_OVERSIZE');
+  assert.equal(connectCalls, 0);
+  assert.equal(`${error.message} ${error.stack}`.includes(oversizedNonce), false);
 });
 
 test('CredentialBroker start and stop own one unrefed polling timer', () => {
@@ -172,6 +219,7 @@ class FakeSocket extends Duplex {
     this.path = path;
     this.respond = respond;
     this.written = '';
+    this.destroyCalls = 0;
     queueMicrotask(() => this.emit('connect'));
   }
 
@@ -190,6 +238,11 @@ class FakeSocket extends Duplex {
         this.push(`${raw}\n`);
       })
       .catch((error) => this.destroy(error));
+  }
+
+  _destroy(error, callback) {
+    this.destroyCalls += 1;
+    callback(error);
   }
 }
 

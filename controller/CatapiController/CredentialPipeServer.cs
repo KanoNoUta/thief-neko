@@ -135,14 +135,14 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
                 var requestLine = await ReadLineAsync(pipe, timeout.Token);
                 if (requestLine.TooLarge)
                 {
-                    await WriteAsync(pipe, Error("request_too_large", "Request rejected."),
+                    await WriteAsync(pipe, Error("oversize"),
                         timeout.Token);
                     return;
                 }
 
                 if (requestLine.Value is null)
                 {
-                    await WriteAsync(pipe, Error("bad_request", "Request rejected."),
+                    await WriteAsync(pipe, Error("malformed"),
                         timeout.Token);
                     return;
                 }
@@ -155,11 +155,11 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                await TryWriteErrorAsync(pipe, "timeout", "Request timed out.", lifetimeToken);
+                await TryWriteErrorAsync(pipe, "timeout", lifetimeToken);
             }
             catch
             {
-                await TryWriteErrorAsync(pipe, "internal_error", "Request failed.", lifetimeToken);
+                await TryWriteErrorAsync(pipe, "internal_error", lifetimeToken);
             }
         }
     }
@@ -174,12 +174,12 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
                 !TryGetString(root, "nonce", out var nonce) ||
                 !NonceMatches(nonce))
             {
-                return Error("unauthorized", "Request denied.");
+                return Error("unauthorized");
             }
 
             if (!TryGetString(root, "operation", out var operation))
             {
-                return Error("bad_request", "Request rejected.");
+                return Error("malformed");
             }
 
             return operation switch
@@ -187,20 +187,20 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
                 "snapshot" => SnapshotResponse(await _authService.GetBrokerSnapshotAsync(ct)),
                 "refresh" => await RefreshAsync(root, ct),
                 "status" => StatusResponse(_authService.GetStatus()),
-                _ => Error("unknown_operation", "Operation rejected."),
+                _ => Error("unknown"),
             };
         }
         catch (JsonException)
         {
-            return Error("bad_request", "Request rejected.");
+            return Error("malformed");
         }
         catch (InvalidOperationException)
         {
-            return Error("unavailable", "Credentials unavailable.");
+            return Error("unavailable");
         }
         catch (CatpawAuthException)
         {
-            return Error("refresh_failed", "Credential refresh failed.");
+            return Error("refresh_failed");
         }
     }
 
@@ -208,7 +208,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
     {
         if (!TryGetString(root, "usedToken", out var usedToken))
         {
-            return Error("bad_request", "Request rejected.");
+            return Error("malformed");
         }
 
         return SnapshotResponse(
@@ -240,10 +240,10 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         },
     };
 
-    private static object Error(string code, string message) => new
+    private static object Error(string code) => new
     {
         ok = false,
-        error = new { code, message },
+        error = code,
     };
 
     private bool NonceMatches(string candidate)
@@ -312,7 +312,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         if (bytes.Length + 1 > MaxMessageBytes)
         {
             bytes = JsonSerializer.SerializeToUtf8Bytes(
-                Error("internal_error", "Response failed."));
+                Error("internal_error"));
         }
 
         await stream.WriteAsync(bytes, ct);
@@ -323,14 +323,13 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
     private static async Task TryWriteErrorAsync(
         Stream stream,
         string code,
-        string message,
         CancellationToken lifetimeToken)
     {
         try
         {
             using var writeTimeout = CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken);
             writeTimeout.CancelAfter(TimeSpan.FromMilliseconds(250));
-            await WriteAsync(stream, Error(code, message), writeTimeout.Token);
+            await WriteAsync(stream, Error(code), writeTimeout.Token);
         }
         catch
         {

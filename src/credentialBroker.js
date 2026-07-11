@@ -37,24 +37,25 @@ export class CredentialBroker {
     this.pollIntervalMs = pollIntervalMs;
     this.setIntervalFn = setIntervalFn;
     this.clearIntervalFn = clearIntervalFn;
-    this.state = { token: '', userMis: '', cookie: '', generation: 0 };
+    this.cachedCurrent = { token: '', userMis: '', cookie: '', generation: 0 };
     this.refreshPromise = null;
     this.timer = null;
   }
 
-  snapshot() {
-    return { ...this.state };
+  async snapshot() {
+    const snapshot = await this.#request({ operation: 'snapshot' });
+    this.#apply(snapshot);
+    return { ...this.cachedCurrent };
   }
 
   async poll() {
-    const before = this.state;
-    const snapshot = await this.#request({ operation: 'snapshot' });
-    this.#apply(snapshot);
-    return !snapshotsEqual(before, this.state);
+    const before = this.cachedCurrent;
+    await this.snapshot();
+    return !snapshotsEqual(before, this.cachedCurrent);
   }
 
   async refreshAfterUnauthorized(usedToken) {
-    if (this.state.token !== usedToken) {
+    if (this.cachedCurrent.token !== usedToken) {
       return true;
     }
     if (this.refreshPromise) {
@@ -90,22 +91,32 @@ export class CredentialBroker {
   async #refresh(usedToken) {
     const snapshot = await this.#request({ operation: 'refresh', usedToken });
     this.#apply(snapshot);
-    return this.state.token !== usedToken;
+    return this.cachedCurrent.token !== usedToken;
   }
 
   #apply(snapshot) {
-    if (snapshot.generation < this.state.generation) {
+    if (snapshot.generation < this.cachedCurrent.generation) {
       throw brokerError('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
     }
-    if (snapshot.generation === this.state.generation
-      && this.state.token
-      && !snapshotsEqual(snapshot, this.state)) {
+    if (snapshot.generation === this.cachedCurrent.generation
+      && this.cachedCurrent.token
+      && !snapshotsEqual(snapshot, this.cachedCurrent)) {
       throw brokerError('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
     }
-    this.state = snapshot;
+    this.cachedCurrent = snapshot;
   }
 
   #request(payload) {
+    const frame = Buffer.from(
+      `${JSON.stringify({ nonce: this.nonce, ...payload })}\n`,
+      'utf8',
+    );
+    if (frame.length > MAX_MESSAGE_BYTES) {
+      return Promise.reject(
+        brokerError('CREDENTIAL_BROKER_OVERSIZE', 'request was oversized'),
+      );
+    }
+
     return new Promise((resolve, reject) => {
       let socket;
       let settled = false;
@@ -113,7 +124,7 @@ export class CredentialBroker {
       let receivedBytes = 0;
       const chunks = [];
 
-      const finish = (error, value, destroy) => {
+      const finish = (error, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -121,18 +132,17 @@ export class CredentialBroker {
         socket?.removeListener('data', onData);
         socket?.removeListener('error', onError);
         socket?.removeListener('end', onEnd);
-        if (destroy) socket?.destroy();
-        else socket?.end();
+        socket?.destroy();
         if (error) reject(error);
         else resolve(value);
       };
 
-      const fail = (code, label) => finish(brokerError(code, label), undefined, true);
+      const fail = (code, label) => finish(brokerError(code, label));
       const send = () => {
         if (sent || settled) return;
         sent = true;
         try {
-          socket.write(`${JSON.stringify({ nonce: this.nonce, ...payload })}\n`);
+          socket.write(frame);
         } catch {
           fail('CREDENTIAL_BROKER_TRANSPORT', 'transport failed');
         }
@@ -161,11 +171,8 @@ export class CredentialBroker {
           return;
         }
         if (response.ok !== true) {
-          const unauthorized = response?.error?.code === 'unauthorized';
-          fail(
-            unauthorized ? 'CREDENTIAL_BROKER_UNAUTHORIZED' : 'CREDENTIAL_BROKER_REJECTED',
-            unauthorized ? 'request was unauthorized' : 'request was rejected',
-          );
+          const mapped = mapServerError(response.error);
+          fail(mapped.code, mapped.label);
           return;
         }
 
@@ -174,7 +181,7 @@ export class CredentialBroker {
           fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
           return;
         }
-        finish(null, snapshot, false);
+        finish(null, snapshot);
       };
       const onError = () => fail('CREDENTIAL_BROKER_TRANSPORT', 'transport failed');
       const onEnd = () => {
@@ -220,6 +227,31 @@ function snapshotsEqual(left, right) {
     && left.userMis === right.userMis
     && left.cookie === right.cookie
     && left.generation === right.generation;
+}
+
+function mapServerError(value) {
+  switch (value) {
+    case 'unauthorized':
+      return {
+        code: 'CREDENTIAL_BROKER_UNAUTHORIZED',
+        label: 'request was unauthorized',
+      };
+    case 'malformed':
+      return {
+        code: 'CREDENTIAL_BROKER_MALFORMED',
+        label: 'response was malformed',
+      };
+    case 'oversize':
+      return {
+        code: 'CREDENTIAL_BROKER_OVERSIZE',
+        label: 'response was oversized',
+      };
+    default:
+      return {
+        code: 'CREDENTIAL_BROKER_REJECTED',
+        label: 'request was rejected',
+      };
+  }
 }
 
 function brokerError(code, label) {
