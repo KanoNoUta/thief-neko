@@ -5,11 +5,30 @@ using System.IO;
 
 namespace CatapiController;
 
+internal enum AuthenticationMode
+{
+    Manual,
+    FollowDesktop,
+    Headless,
+}
+
 internal sealed record ControllerSettings(
     string Token,
     string Tenant,
     string GatewayPath,
-    bool AutoToken = false);
+    AuthenticationMode AuthenticationMode = AuthenticationMode.Manual)
+{
+    public ControllerSettings(string Token, string Tenant, string GatewayPath, bool AutoToken)
+        : this(
+            Token,
+            Tenant,
+            GatewayPath,
+            AutoToken ? AuthenticationMode.FollowDesktop : AuthenticationMode.Manual)
+    {
+    }
+
+    public bool AutoToken => AuthenticationMode == AuthenticationMode.FollowDesktop;
+}
 
 internal sealed class SettingsStore
 {
@@ -17,7 +36,8 @@ internal sealed class SettingsStore
         string ProtectedToken,
         string Tenant,
         string GatewayPath,
-        bool AutoToken = false);
+        bool AutoToken = false,
+        AuthenticationMode? AuthenticationMode = null);
 
     public string FilePath { get; }
 
@@ -44,16 +64,18 @@ internal sealed class SettingsStore
 
         var protectedBytes = Convert.FromBase64String(stored.ProtectedToken);
         var tokenBytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
+        var authenticationMode = stored.AuthenticationMode
+            ?? (stored.AutoToken ? AuthenticationMode.FollowDesktop : AuthenticationMode.Manual);
         return new ControllerSettings(
             Encoding.UTF8.GetString(tokenBytes),
             stored.Tenant,
             stored.GatewayPath,
-            stored.AutoToken);
+            authenticationMode);
     }
 
     public async Task SaveAsync(ControllerSettings settings)
     {
-        if ((!settings.AutoToken && string.IsNullOrWhiteSpace(settings.Token))
+        if ((settings.AuthenticationMode == AuthenticationMode.Manual && string.IsNullOrWhiteSpace(settings.Token))
             || string.IsNullOrWhiteSpace(settings.Tenant)
             || !Directory.Exists(settings.GatewayPath))
         {
@@ -66,7 +88,8 @@ internal sealed class SettingsStore
             Convert.ToBase64String(protectedBytes),
             settings.Tenant.Trim(),
             settings.GatewayPath,
-            settings.AutoToken);
+            settings.AutoToken,
+            settings.AuthenticationMode);
 
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         var temporaryPath = FilePath + ".tmp";

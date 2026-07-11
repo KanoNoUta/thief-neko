@@ -2,16 +2,20 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CatapiController;
+using CatapiController.Tests;
 
-var tests = new (string Name, Func<Task> Run)[]
+var tests = new List<(string Name, Func<Task> Run)>
 {
     ("settings persist automatic Token mode", SettingsPersistAutomaticModeAsync),
     ("legacy settings default automatic Token mode to off", LegacySettingsDefaultToManualAsync),
+    ("legacy automatic settings map to follow desktop mode", LegacyAutomaticSettingsMapToFollowDesktopAsync),
+    ("settings persist headless authentication mode", SettingsPersistHeadlessModeAsync),
     ("automatic mode selects current Catpaw Token", AutomaticModeSelectsCurrentTokenAsync),
     ("manual mode preserves saved Token", ManualModePreservesSavedTokenAsync),
     ("automatic mode falls back to saved Token", AutomaticModeFallsBackAsync),
     ("automatic mode rejects missing current and fallback Tokens", AutomaticModeRejectsMissingTokenAsync),
 };
+tests.AddRange(AuthSessionStoreTests.All());
 
 foreach (var test in tests)
 {
@@ -52,6 +56,51 @@ static async Task LegacySettingsDefaultToManualAsync()
 
     True(loaded is not null, "legacy settings should load");
     False(loaded!.AutoToken, "legacy settings should remain in manual mode");
+    Equal(AuthenticationMode.Manual, loaded.AuthenticationMode,
+        "legacy settings without AutoToken should map to manual mode");
+}
+
+static async Task LegacyAutomaticSettingsMapToFollowDesktopAsync()
+{
+    using var directory = new TemporaryDirectory();
+    var filePath = Path.Combine(directory.Path, "settings.json");
+    var protectedBytes = ProtectedData.Protect(
+        Encoding.UTF8.GetBytes("legacy-token"),
+        null,
+        DataProtectionScope.CurrentUser);
+    var legacy = new
+    {
+        ProtectedToken = Convert.ToBase64String(protectedBytes),
+        Tenant = "tenant",
+        GatewayPath = directory.Path,
+        AutoToken = true,
+    };
+    await File.WriteAllTextAsync(filePath, JsonSerializer.Serialize(legacy));
+
+    var loaded = await new SettingsStore(filePath).LoadAsync();
+
+    True(loaded is not null, "legacy automatic settings should load");
+    Equal(AuthenticationMode.FollowDesktop, loaded!.AuthenticationMode,
+        "legacy AutoToken=true should map to follow desktop mode");
+    Equal("legacy-token", loaded.Token, "legacy token should be retained");
+    Equal("tenant", loaded.Tenant, "legacy tenant should be retained");
+    Equal(directory.Path, loaded.GatewayPath, "legacy gateway path should be retained");
+}
+
+static async Task SettingsPersistHeadlessModeAsync()
+{
+    using var directory = new TemporaryDirectory();
+    var filePath = Path.Combine(directory.Path, "settings.json");
+    var settings = new ControllerSettings(
+        "fallback-token",
+        "tenant",
+        directory.Path,
+        AuthenticationMode.Headless);
+
+    var store = new SettingsStore(filePath);
+    await store.SaveAsync(settings);
+
+    Equal(settings, await store.LoadAsync(), "headless settings should round-trip");
 }
 
 static Task AutomaticModeSelectsCurrentTokenAsync()
