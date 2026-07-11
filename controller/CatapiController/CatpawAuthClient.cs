@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace CatapiController;
 
-internal sealed record QrLoginChallenge(string Code, string QrCodeUrl, DateTimeOffset? ExpiresAt);
+internal sealed record QrLoginChallenge(string Code, string QrCodeUrl, DateTimeOffset ExpiresAt);
 
 internal sealed record QrLoginPoll(
     string Status,
@@ -28,13 +28,26 @@ internal sealed class CatpawAuthException : Exception
 internal sealed class CatpawAuthClient
 {
     private static readonly Uri ServiceRoot = new("https://catpaw.meituan.com");
+    internal static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromSeconds(15);
     private readonly HttpClient _http;
     private readonly string _tenant;
+    private readonly TimeSpan _operationTimeout;
 
     public CatpawAuthClient(HttpClient http, string tenant)
+        : this(http, tenant, DefaultOperationTimeout)
+    {
+    }
+
+    internal CatpawAuthClient(HttpClient http, string tenant, TimeSpan operationTimeout)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
+        if (operationTimeout <= TimeSpan.Zero || operationTimeout == Timeout.InfiniteTimeSpan)
+        {
+            throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+        }
+
+        _operationTimeout = operationTimeout;
     }
 
     public async Task<QrLoginChallenge> CreateQrAsync(CancellationToken ct)
@@ -42,23 +55,33 @@ internal sealed class CatpawAuthClient
         var data = await SendAsync(HttpMethod.Get, "/api/login/qrcode", null, null, _tenant,
             "QR challenge", ct);
         var code = RequiredString(data, "QR challenge", "code");
-        var qrCodeUrl = RequiredString(data, "QR challenge", "qrcodeUrl", "qrCodeUrl", "url", "qrcode");
-        return new QrLoginChallenge(code, qrCodeUrl,
-            OptionalDateTime(data, "expiresAt", "expireTime", "expirationTime"));
+        var qrCodeUrl = RequiredHttpsUrl(data, "QR challenge",
+            "qrcodeUrl", "qrCodeUrl", "url", "qrcode");
+        var expiresAt = RequiredDateTime(data, "QR challenge",
+            "expiresAt", "expireTime", "expirationTime");
+        return new QrLoginChallenge(code, qrCodeUrl, expiresAt);
     }
 
     public async Task<QrLoginPoll> PollQrAsync(string code, CancellationToken ct)
     {
         var data = await SendAsync(HttpMethod.Post, "/api/login/accessToken",
             new Dictionary<string, object?> { ["code"] = code }, null, _tenant, "QR poll", ct);
-        var status = OptionalString(data, "status", "loginStatus") ?? string.Empty;
-        var requiresBinding = OptionalBoolean(data,
+        var status = NormalizePollStatus(RequiredString(
+            data, "QR poll", "status", "state", "loginStatus"));
+        var mobileBound = OptionalStrictBoolean(data, "QR poll", "mobileBound");
+        var explicitBinding = OptionalStrictBoolean(data, "QR poll",
             "requiresMobileBinding", "needBindMobile", "mobileBindingRequired");
+        var requiresBinding = explicitBinding ?? (mobileBound is false);
 
-        var hasAccess = HasNonemptyString(data, "accessToken");
-        var hasRefresh = HasNonemptyString(data, "refreshToken");
+        var hasTokenFields = HasAnyProperty(data, "accessToken", "refreshToken");
+        var isTerminal = status is "confirmed" or "mobileBound";
+        if (hasTokenFields != isTerminal)
+        {
+            throw Failure("QR poll", "invalid state data");
+        }
+
         AuthSession? session = null;
-        if (hasAccess || hasRefresh)
+        if (hasTokenFields)
         {
             session = ParseSession(data, _tenant, "QR poll");
         }
@@ -79,7 +102,7 @@ internal sealed class CatpawAuthClient
             }, null, _tenant, "SMS request", ct);
         return new SmsChallenge(
             RequiredString(data, "SMS request", "uuid"),
-            OptionalString(data, "requestCode"));
+            OptionalString(data, "SMS request", "requestCode"));
     }
 
     public async Task<MobileVerification> VerifySmsAsync(
@@ -94,8 +117,8 @@ internal sealed class CatpawAuthClient
                 ["verificationCode"] = code,
             }, null, _tenant, "SMS verification", ct);
         return new MobileVerification(
-            OptionalBoolean(data, "verified", "valid", "success"),
-            OptionalBoolean(data,
+            RequiredBoolean(data, "SMS verification", "verified", "valid", "success"),
+            RequiredBoolean(data, "SMS verification",
                 "invitationCodeRequired", "needInvitationCode", "invitationRequired"));
     }
 
@@ -135,13 +158,22 @@ internal sealed class CatpawAuthClient
         var data = await SendAsync(HttpMethod.Post, "/api/login/refreshToken",
             new Dictionary<string, object?> { ["refreshToken"] = current.RefreshToken },
             current.AccessToken, current.Tenant, "token refresh", ct);
-        var refreshed = ParseSession(data, current.Tenant, "token refresh");
-        return refreshed with
+        var refreshed = ParseSession(data, current.Tenant, "token refresh", requireIdentity: false);
+        refreshed = refreshed with
         {
-            UserId = OptionalString(data, "userId", "id", "userMis") ?? current.UserId,
-            AccountLabel = OptionalString(data, "accountLabel", "accountName", "name", "nickname")
+            UserId = OptionalString(data, "token refresh", "userId", "id", "userMis")
+                ?? current.UserId,
+            AccountLabel = OptionalString(data, "token refresh",
+                    "accountLabel", "accountName", "name", "nickname")
                 ?? current.AccountLabel,
         };
+        if (string.IsNullOrWhiteSpace(refreshed.UserId) ||
+            string.IsNullOrWhiteSpace(refreshed.AccountLabel))
+        {
+            throw Failure("token refresh", "missing identity fields");
+        }
+
+        return refreshed;
     }
 
     public async Task<AccountInfo> GetUserInfoAsync(string accessToken, CancellationToken ct)
@@ -162,63 +194,75 @@ internal sealed class CatpawAuthClient
         string operation,
         CancellationToken ct)
     {
-        using var request = new HttpRequestMessage(method, RequestUri(path));
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        AddHeader(request, "client-type", "CatPaw IDE");
-        AddHeader(request, "ide-version", "2026.2.3");
-        AddHeader(request, "tenant", tenant);
-        AddHeader(request, "platform", "win32-x64");
-        if (accessToken is not null)
-        {
-            AddHeader(request, "Catpaw-Auth", accessToken);
-        }
-
-        if (body is not null)
-        {
-            request.Content = JsonContent.Create(body);
-        }
-
-        using var response = await _http.SendAsync(
-            request, HttpCompletionOption.ResponseHeadersRead, ct);
-        if (!response.IsSuccessStatusCode)
-        {
-            throw Failure(operation, $"HTTP status {(int)response.StatusCode}");
-        }
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        operationCancellation.CancelAfter(_operationTimeout);
+        var operationToken = operationCancellation.Token;
 
         try
         {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
-            var root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object ||
-                !root.TryGetProperty("code", out var codeElement) ||
-                !TryReadInt(codeElement, out var logicalCode))
+            using var request = new HttpRequestMessage(method, new Uri(ServiceRoot, path));
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            AddHeader(request, "client-type", "CatPaw IDE");
+            AddHeader(request, "ide-version", "2026.2.3");
+            AddHeader(request, "tenant", tenant);
+            AddHeader(request, "platform", "win32-x64");
+            if (accessToken is not null)
             {
-                throw Failure(operation, "invalid response");
+                AddHeader(request, "Catpaw-Auth", accessToken);
             }
 
-            if (logicalCode != 0)
+            if (body is not null)
             {
-                throw Failure(operation, $"logical code {logicalCode}");
+                request.Content = JsonContent.Create(body);
             }
 
-            if (!root.TryGetProperty("data", out var data) ||
-                data.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            using var response = await _http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, operationToken);
+            if (!response.IsSuccessStatusCode)
             {
-                throw Failure(operation, "missing data");
+                throw Failure(operation, $"HTTP status {(int)response.StatusCode}");
             }
 
-            return data.Clone();
+            try
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(operationToken);
+                using var document = await JsonDocument.ParseAsync(
+                    stream, cancellationToken: operationToken);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object ||
+                    !root.TryGetProperty("code", out var codeElement) ||
+                    !TryReadInt(codeElement, out var logicalCode))
+                {
+                    throw Failure(operation, "invalid response");
+                }
+
+                if (logicalCode != 0)
+                {
+                    throw Failure(operation, $"logical code {logicalCode}");
+                }
+
+                if (!root.TryGetProperty("data", out var data) ||
+                    data.ValueKind != JsonValueKind.Object)
+                {
+                    throw Failure(operation, "invalid data");
+                }
+
+                return data.Clone();
+            }
+            catch (JsonException)
+            {
+                throw Failure(operation, "malformed response");
+            }
         }
-        catch (JsonException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            throw Failure(operation, "malformed response");
+            throw new OperationCanceledException(ct);
+        }
+        catch (OperationCanceledException) when (operationCancellation.IsCancellationRequested)
+        {
+            throw Failure(operation, "timed out");
         }
     }
-
-    private Uri RequestUri(string path) => _http.BaseAddress is null
-        ? new Uri(ServiceRoot, path)
-        : new Uri(_http.BaseAddress, path);
 
     private static Dictionary<string, object?> MobileBody(
         string mobile,
@@ -238,33 +282,80 @@ internal sealed class CatpawAuthClient
         return body;
     }
 
-    private static AuthSession ParseSession(JsonElement data, string tenant, string operation)
+    private static AuthSession ParseSession(
+        JsonElement data,
+        string tenant,
+        string operation,
+        bool requireIdentity = true)
     {
         var accessToken = RequiredString(data, operation, "accessToken");
         var refreshToken = RequiredString(data, operation, "refreshToken");
+        var userId = requireIdentity
+            ? RequiredString(data, operation, "userId", "id", "userMis")
+            : OptionalString(data, operation, "userId", "id", "userMis") ?? string.Empty;
+        var accountLabel = requireIdentity
+            ? RequiredString(data, operation, "accountLabel", "accountName", "name", "nickname")
+            : OptionalString(data, operation,
+                "accountLabel", "accountName", "name", "nickname") ?? string.Empty;
         return new AuthSession(
             accessToken,
             refreshToken,
-            OptionalString(data, "userId", "id", "userMis") ?? string.Empty,
-            OptionalString(data, "accountLabel", "accountName", "name", "nickname") ?? string.Empty,
+            userId,
+            accountLabel,
             tenant,
-            OptionalDateTime(data, "accessExpiresAt", "accessTokenExpiresAt", "expiresAt"),
-            OptionalDateTime(data, "refreshExpiresAt", "refreshTokenExpiresAt"),
+            OptionalDateTime(data, operation,
+                "accessExpiresAt", "accessTokenExpiresAt", "expiresAt"),
+            OptionalDateTime(data, operation, "refreshExpiresAt", "refreshTokenExpiresAt"),
             DateTimeOffset.UtcNow);
     }
 
-    private static string RequiredString(JsonElement data, string operation, params string[] names) =>
-        OptionalString(data, names) is { Length: > 0 } value
-            ? value
-            : throw Failure(operation, "missing required fields");
-
-    private static string? OptionalString(JsonElement data, params string[] names)
+    private static string RequiredString(JsonElement data, string operation, params string[] names)
     {
-        if (data.ValueKind != JsonValueKind.Object)
+        foreach (var name in names)
         {
-            return null;
+            if (!data.TryGetProperty(name, out var value))
+            {
+                continue;
+            }
+
+            if (value.ValueKind != JsonValueKind.String ||
+                string.IsNullOrWhiteSpace(value.GetString()))
+            {
+                throw Failure(operation, "invalid required fields");
+            }
+
+            return value.GetString()!;
         }
 
+        throw Failure(operation, "missing required fields");
+    }
+
+    private static string RequiredHttpsUrl(
+        JsonElement data,
+        string operation,
+        params string[] names)
+    {
+        var value = RequiredString(data, operation, names);
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            uri.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw Failure(operation, "invalid required fields");
+        }
+
+        return value;
+    }
+
+    private static DateTimeOffset RequiredDateTime(
+        JsonElement data,
+        string operation,
+        params string[] names) => OptionalDateTime(data, operation, names)
+        ?? throw Failure(operation, "invalid required fields");
+
+    private static string? OptionalString(
+        JsonElement data,
+        string operation,
+        params string[] names)
+    {
         foreach (var name in names)
         {
             if (!data.TryGetProperty(name, out var value))
@@ -274,28 +365,59 @@ internal sealed class CatpawAuthClient
 
             if (value.ValueKind == JsonValueKind.String)
             {
-                return value.GetString();
+                var text = value.GetString();
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    throw Failure(operation, "invalid optional fields");
+                }
+
+                return text;
             }
 
-            if (value.ValueKind == JsonValueKind.Number)
+            if (value.ValueKind == JsonValueKind.Null)
             {
-                return value.GetRawText();
+                return null;
             }
+
+            throw Failure(operation, "invalid optional fields");
         }
 
         return null;
     }
 
-    private static bool HasNonemptyString(JsonElement data, string name) =>
-        !string.IsNullOrWhiteSpace(OptionalString(data, name));
-
-    private static bool OptionalBoolean(JsonElement data, params string[] names)
+    private static string NormalizePollStatus(string status)
     {
-        if (data.ValueKind != JsonValueKind.Object)
+        if (status.Equals("pending", StringComparison.OrdinalIgnoreCase))
         {
-            return false;
+            return "pending";
         }
 
+        if (status.Equals("scanned", StringComparison.OrdinalIgnoreCase))
+        {
+            return "scanned";
+        }
+
+        if (status.Equals("confirmed", StringComparison.OrdinalIgnoreCase))
+        {
+            return "confirmed";
+        }
+
+        if (status.Equals("mobileBound", StringComparison.OrdinalIgnoreCase))
+        {
+            return "mobileBound";
+        }
+
+        throw Failure("QR poll", "unknown state");
+    }
+
+    private static bool HasAnyProperty(JsonElement data, params string[] names) =>
+        names.Any(name => data.TryGetProperty(name, out _));
+
+    private static bool? OptionalStrictBoolean(
+        JsonElement data,
+        string operation,
+        params string[] names)
+    {
         foreach (var name in names)
         {
             if (!data.TryGetProperty(name, out var value))
@@ -303,32 +425,28 @@ internal sealed class CatpawAuthClient
                 continue;
             }
 
-            if (value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            if (value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
             {
-                return value.GetBoolean();
+                throw Failure(operation, "invalid boolean fields");
             }
 
-            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
-            {
-                return number != 0;
-            }
-
-            if (value.ValueKind == JsonValueKind.String && bool.TryParse(value.GetString(), out var parsed))
-            {
-                return parsed;
-            }
+            return value.GetBoolean();
         }
 
-        return false;
+        return null;
     }
 
-    private static DateTimeOffset? OptionalDateTime(JsonElement data, params string[] names)
-    {
-        if (data.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
+    private static bool RequiredBoolean(
+        JsonElement data,
+        string operation,
+        params string[] names) => OptionalStrictBoolean(data, operation, names)
+        ?? throw Failure(operation, "missing boolean fields");
 
+    private static DateTimeOffset? OptionalDateTime(
+        JsonElement data,
+        string operation,
+        params string[] names)
+    {
         foreach (var name in names)
         {
             if (!data.TryGetProperty(name, out var value))
@@ -352,9 +470,11 @@ internal sealed class CatpawAuthClient
                 }
                 catch (ArgumentOutOfRangeException)
                 {
-                    return null;
+                    throw Failure(operation, "invalid timestamp fields");
                 }
             }
+
+            throw Failure(operation, "invalid timestamp fields");
         }
 
         return null;
@@ -362,13 +482,8 @@ internal sealed class CatpawAuthClient
 
     private static bool TryReadInt(JsonElement value, out int result)
     {
-        if (value.ValueKind == JsonValueKind.Number)
-        {
-            return value.TryGetInt32(out result);
-        }
-
         result = default;
-        return value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out result);
+        return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out result);
     }
 
     private static void AddHeader(HttpRequestMessage request, string name, string value) =>

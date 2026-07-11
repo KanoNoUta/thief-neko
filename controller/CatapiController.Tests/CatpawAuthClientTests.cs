@@ -21,10 +21,23 @@ internal static class CatpawAuthClientTests
         yield return ("Catpaw auth binds mobile with QR context", BindMobileAsync);
         yield return ("Catpaw auth refreshes with current credentials", RefreshAsync);
         yield return ("Catpaw auth gets user info with current credentials", GetUserInfoAsync);
+        yield return ("Catpaw auth pins requests to the official origin", PinsOfficialOriginAsync);
+        yield return ("Catpaw auth defaults operation timeout to fifteen seconds", DefaultTimeoutAsync);
+        yield return ("Catpaw auth enforces its operation timeout", InternalTimeoutAsync);
         yield return ("Catpaw auth rejects logical errors without secrets", NonzeroCodeIsRedactedAsync);
         yield return ("Catpaw auth rejects HTTP errors without response body", HttpErrorIsRedactedAsync);
         yield return ("Catpaw auth rejects malformed JSON without response body", MalformedJsonIsRedactedAsync);
+        yield return ("Catpaw auth rejects invalid envelope schemas", InvalidEnvelopeSchemaAsync);
         yield return ("Catpaw auth rejects missing tokens without submitted secrets", MissingTokenIsRedactedAsync);
+        yield return ("Catpaw auth rejects non-object success data", NonObjectDataAsync);
+        yield return ("Catpaw auth rejects invalid QR challenge schemas", InvalidQrChallengeSchemasAsync);
+        yield return ("Catpaw auth supports strict QR polling states", PollingStatesAsync);
+        yield return ("Catpaw auth rejects invalid QR polling schemas", InvalidPollingSchemasAsync);
+        yield return ("Catpaw auth rejects invalid SMS schemas", InvalidSmsSchemasAsync);
+        yield return ("Catpaw auth rejects invalid verification schemas", InvalidVerificationSchemasAsync);
+        yield return ("Catpaw auth rejects blank and numeric tokens", InvalidTokenSchemasAsync);
+        yield return ("Catpaw auth rejects invalid session expiry schemas", InvalidSessionExpirySchemaAsync);
+        yield return ("Catpaw auth rejects invalid identity schemas", InvalidIdentitySchemasAsync);
         yield return ("Catpaw auth honors caller cancellation", CancellationAsync);
         yield return ("Catpaw auth preserves injected HTTP timeout", PreservesTimeoutAsync);
     }
@@ -58,7 +71,8 @@ internal static class CatpawAuthClientTests
 
         AssertEqual("confirmed", result.Status, "QR status should be parsed");
         AssertTrue(result.Session is not null, "confirmed QR poll should contain a session");
-        AssertEqual("access-result", result.Session!.AccessToken, "QR access token should be parsed");
+        AssertSecretEqual("access-result", result.Session!.AccessToken,
+            "QR access token should be parsed");
         AssertTrue(!result.RequiresMobileBinding, "confirmed QR login should not require binding");
     }
 
@@ -147,8 +161,8 @@ internal static class CatpawAuthClientTests
 
         var result = await fixture.Client.RefreshAsync(current, default);
 
-        AssertEqual("rotated-access", result.AccessToken, "refresh should rotate access token");
-        AssertEqual("rotated-refresh", result.RefreshToken, "refresh should rotate refresh token");
+        AssertSecretEqual("rotated-access", result.AccessToken, "refresh should rotate access token");
+        AssertSecretEqual("rotated-refresh", result.RefreshToken, "refresh should rotate refresh token");
         AssertEqual(current.UserId, result.UserId, "refresh should preserve user ID");
         AssertEqual(current.AccountLabel, result.AccountLabel, "refresh should preserve account label");
         AssertEqual(current.Tenant, result.Tenant, "refresh should preserve tenant");
@@ -167,6 +181,56 @@ internal static class CatpawAuthClientTests
 
         AssertEqual("user-result", result.UserId, "user ID should be parsed");
         AssertEqual("Catpaw User", result.AccountLabel, "account label should be parsed");
+    }
+
+    private static async Task PinsOfficialOriginAsync()
+    {
+        var sent = false;
+        using var fixture = Fixture(async request =>
+        {
+            sent = true;
+            await AssertRequestAsync(request, HttpMethod.Post, "/api/login/refreshToken",
+                """{"refreshToken":"current-refresh-secret"}""", true,
+                "current-access-secret", "current-tenant");
+            return JsonResponse("""{"code":0,"data":{"accessToken":"rotated-access","refreshToken":"rotated-refresh","accessExpiresAt":"2026-07-11T10:00:00Z","refreshExpiresAt":"2026-08-11T10:00:00Z"}}""");
+        }, baseAddress: new Uri("https://untrusted.invalid/capture/"));
+
+        await fixture.Client.RefreshAsync(CurrentSession(), default);
+
+        AssertTrue(sent, "request should be sent through the fake handler");
+    }
+
+    private static Task DefaultTimeoutAsync()
+    {
+        AssertEqual(TimeSpan.FromSeconds(15), CatpawAuthClient.DefaultOperationTimeout,
+            "production operation timeout should be exactly fifteen seconds");
+        return Task.CompletedTask;
+    }
+
+    private static async Task InternalTimeoutAsync()
+    {
+        var handlerCancelled = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var fixture = Fixture(async (_, cancellationToken) =>
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                handlerCancelled.SetResult();
+                throw;
+            }
+
+            throw new InvalidOperationException("unreachable");
+        }, httpTimeout: Timeout.InfiniteTimeSpan, operationTimeout: TimeSpan.FromMilliseconds(20));
+
+        var error = await CaptureAuthErrorAsync(() => fixture.Client.CreateQrAsync(default));
+
+        await handlerCancelled.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        AssertTrue(error.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase),
+            "internal timeout should have a redacted timeout category");
     }
 
     private static async Task NonzeroCodeIsRedactedAsync()
@@ -210,6 +274,15 @@ internal static class CatpawAuthClientTests
         AssertRedacted(error, bodySecret, "13800138000", "device-uuid");
     }
 
+    private static async Task InvalidEnvelopeSchemaAsync()
+    {
+        using var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+            """{"code":"0","data":{"verified":true,"invitationCodeRequired":false}}""")));
+
+        await CaptureAuthErrorAsync(() => fixture.Client.VerifySmsAsync(
+            "13800138000", "123456", default));
+    }
+
     private static async Task MissingTokenIsRedactedAsync()
     {
         using var fixture = Fixture(_ => Task.FromResult(JsonResponse(
@@ -219,6 +292,170 @@ internal static class CatpawAuthClientTests
             "qr-code-secret", "13800138000", "123456", "INVITE", default));
 
         AssertRedacted(error, "only-access-secret", "qr-code-secret", "13800138000", "123456", "INVITE");
+    }
+
+    private static async Task NonObjectDataAsync()
+    {
+        using var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+            """{"code":0,"data":true}""")));
+
+        await CaptureAuthErrorAsync(() => fixture.Client.VerifySmsAsync(
+            "13800138000", "123456", default));
+    }
+
+    private static async Task InvalidQrChallengeSchemasAsync()
+    {
+        var invalidSchemas = new[]
+        {
+            """{"code":0,"data":{"code":" ","qrcodeUrl":"https://example.invalid/qr","expiresAt":"2026-07-11T09:00:00Z"}}""",
+            """{"code":0,"data":{"code":"qr-secret","qrcodeUrl":"not-a-url","expiresAt":"2026-07-11T09:00:00Z"}}""",
+            """{"code":0,"data":{"code":"qr-secret","qrcodeUrl":"https://example.invalid/qr"}}""",
+        };
+
+        foreach (var schema in invalidSchemas)
+        {
+            using var fixture = Fixture(_ => Task.FromResult(JsonResponse(schema)));
+            var error = await CaptureAuthErrorAsync(() => fixture.Client.CreateQrAsync(default));
+            AssertRedacted(error, "qr-secret");
+        }
+    }
+
+    private static async Task PollingStatesAsync()
+    {
+        var responses = new Queue<string>(
+        [
+            """{"code":0,"data":{"status":"pending","mobileBound":true}}""",
+            """{"code":0,"data":{"state":"scanned","mobileBound":false}}""",
+            SessionEnvelope("mobileBound"),
+        ]);
+        using var fixture = Fixture(_ => Task.FromResult(JsonResponse(responses.Dequeue())));
+
+        var pending = await fixture.Client.PollQrAsync("qr-code-secret", default);
+        var scanned = await fixture.Client.PollQrAsync("qr-code-secret", default);
+        var mobileBound = await fixture.Client.PollQrAsync("qr-code-secret", default);
+
+        AssertEqual("pending", pending.Status, "pending state should be parsed");
+        AssertTrue(pending.Session is null, "pending state should not contain a session");
+        AssertEqual("scanned", scanned.Status, "scanned state should be parsed");
+        AssertTrue(scanned.RequiresMobileBinding,
+            "scanned unbound account should require mobile binding");
+        AssertEqual("mobileBound", mobileBound.Status, "mobileBound state should be parsed");
+        AssertTrue(mobileBound.Session is not null,
+            "mobileBound state with credentials should contain a session");
+    }
+
+    private static async Task InvalidPollingSchemasAsync()
+    {
+        var invalidSchemas = new[]
+        {
+            """{"code":0,"data":{"mobileBound":true}}""",
+            """{"code":0,"data":{"status":7,"mobileBound":true}}""",
+            """{"code":0,"data":{"status":"unexpected","mobileBound":true}}""",
+            """{"code":0,"data":{"status":"pending","mobileBound":"yes"}}""",
+            """{"code":0,"data":{"status":"pending","mobileBound":true,"accessToken":7}}""",
+        };
+
+        foreach (var schema in invalidSchemas)
+        {
+            using var fixture = Fixture(_ => Task.FromResult(JsonResponse(schema)));
+            await CaptureAuthErrorAsync(() => fixture.Client.PollQrAsync("qr-code-secret", default));
+        }
+    }
+
+    private static async Task InvalidSmsSchemasAsync()
+    {
+        var invalidSchemas = new[]
+        {
+            """{"code":0,"data":{"uuid":7}}""",
+            """{"code":0,"data":{"uuid":"sms-uuid","requestCode":7}}""",
+        };
+
+        foreach (var schema in invalidSchemas)
+        {
+            using var fixture = Fixture(_ => Task.FromResult(JsonResponse(schema)));
+            await CaptureAuthErrorAsync(() => fixture.Client.SendSmsAsync(
+                "13800138000", "device-uuid", default));
+        }
+    }
+
+    private static async Task InvalidVerificationSchemasAsync()
+    {
+        var invalidSchemas = new[]
+        {
+            """{"code":0,"data":{"verified":1,"invitationCodeRequired":false}}""",
+            """{"code":0,"data":{"verified":true,"invitationCodeRequired":"false"}}""",
+            """{"code":0,"data":{"verified":true}}""",
+        };
+
+        foreach (var schema in invalidSchemas)
+        {
+            using var fixture = Fixture(_ => Task.FromResult(JsonResponse(schema)));
+            await CaptureAuthErrorAsync(() => fixture.Client.VerifySmsAsync(
+                "13800138000", "123456", default));
+        }
+    }
+
+    private static async Task InvalidTokenSchemasAsync()
+    {
+        var invalidSchemas = new[]
+        {
+            """{"code":0,"data":{"accessToken":7,"refreshToken":"refresh-secret","userId":"user-result","accountLabel":"Catpaw User"}}""",
+            """{"code":0,"data":{"accessToken":"access-secret","refreshToken":" ","userId":"user-result","accountLabel":"Catpaw User"}}""",
+        };
+
+        foreach (var schema in invalidSchemas)
+        {
+            using var fixture = Fixture(_ => Task.FromResult(JsonResponse(schema)));
+            var error = await CaptureAuthErrorAsync(() => fixture.Client.LoginMobileAsync(
+                "13800138000", "123456", "INVITE", default));
+            AssertRedacted(error, "access-secret", "refresh-secret", "13800138000", "123456", "INVITE");
+        }
+    }
+
+    private static async Task InvalidSessionExpirySchemaAsync()
+    {
+        using var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+            """{"code":0,"data":{"accessToken":"access-secret","refreshToken":"refresh-secret","userId":"user-result","accountLabel":"Catpaw User","accessExpiresAt":true}}""")));
+
+        var error = await CaptureAuthErrorAsync(() => fixture.Client.LoginMobileAsync(
+            "13800138000", "123456", null, default));
+        AssertRedacted(error, "access-secret", "refresh-secret", "13800138000", "123456");
+    }
+
+    private static async Task InvalidIdentitySchemasAsync()
+    {
+        using (var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+                   """{"code":0,"data":{"accessToken":"access-secret","refreshToken":"refresh-secret"}}"""))))
+        {
+            var error = await CaptureAuthErrorAsync(() => fixture.Client.LoginMobileAsync(
+                "13800138000", "123456", null, default));
+            AssertRedacted(error, "access-secret", "refresh-secret", "13800138000", "123456");
+        }
+
+        using (var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+                   """{"code":0,"data":{"accessToken":"access-secret","refreshToken":"refresh-secret","userId":" ","accountLabel":"Catpaw User"}}"""))))
+        {
+            var error = await CaptureAuthErrorAsync(() => fixture.Client.LoginMobileAsync(
+                "13800138000", "123456", null, default));
+            AssertRedacted(error, "access-secret", "refresh-secret", "13800138000", "123456");
+        }
+
+        using (var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+                   """{"code":0,"data":{"userId":"user-result","accountLabel":7}}"""))))
+        {
+            await CaptureAuthErrorAsync(() => fixture.Client.GetUserInfoAsync(
+                "access-request-secret", default));
+        }
+
+        var identityless = CurrentSession() with { UserId = "", AccountLabel = "" };
+        using (var fixture = Fixture(_ => Task.FromResult(JsonResponse(
+                   """{"code":0,"data":{"accessToken":"rotated-access","refreshToken":"rotated-refresh"}}"""))))
+        {
+            var error = await CaptureAuthErrorAsync(() => fixture.Client.RefreshAsync(
+                identityless, default));
+            AssertRedacted(error, "rotated-access", "rotated-refresh",
+                identityless.AccessToken, identityless.RefreshToken);
+        }
     }
 
     private static async Task CancellationAsync()
@@ -235,8 +472,10 @@ internal static class CatpawAuthClientTests
         {
             await fixture.Client.CreateQrAsync(cancellation.Token);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
+            AssertEqual(cancellation.Token, error.CancellationToken,
+                "caller cancellation token should be preserved");
             return;
         }
 
@@ -263,7 +502,8 @@ internal static class CatpawAuthClientTests
         string tenant = Tenant)
     {
         AssertEqual(method, request.Method, "HTTP method should match");
-        AssertEqual(path, request.RequestUri!.AbsolutePath, "request path should match");
+        AssertEqual(new Uri("https://catpaw.meituan.com" + path), request.RequestUri,
+            "request must use the exact official absolute URI");
         AssertHeader(request, "client-type", "CatPaw IDE");
         AssertHeader(request, "ide-version", "2026.2.3");
         AssertHeader(request, "tenant", tenant);
@@ -295,21 +535,36 @@ internal static class CatpawAuthClientTests
     private static void AssertHeader(HttpRequestMessage request, string name, string expected)
     {
         AssertTrue(request.Headers.TryGetValues(name, out var values), $"missing {name} header");
-        AssertEqual(expected, values!.Single(), $"{name} header should match");
+        AssertTrue(values!.SequenceEqual([expected]), $"{name} header should match");
     }
 
     private static void AssertJsonEqual(string expected, string actual)
     {
         using var expectedJson = JsonDocument.Parse(expected);
-        using var actualJson = JsonDocument.Parse(actual);
-        AssertTrue(JsonElement.DeepEquals(expectedJson.RootElement, actualJson.RootElement),
-            $"JSON body should match: actual {actual}");
+        try
+        {
+            using var actualJson = JsonDocument.Parse(actual);
+            AssertTrue(JsonElement.DeepEquals(expectedJson.RootElement, actualJson.RootElement),
+                $"JSON body should match fields: {FieldNames(expectedJson.RootElement)}");
+        }
+        catch (JsonException)
+        {
+            throw new InvalidOperationException(
+                $"JSON body should be valid with fields: {FieldNames(expectedJson.RootElement)}");
+        }
     }
+
+    private static string FieldNames(JsonElement element) => element.ValueKind == JsonValueKind.Object
+        ? string.Join(",", element.EnumerateObject().Select(property => property.Name))
+        : "<non-object>";
+
+    private static void AssertSecretEqual(string expected, string actual, string message) =>
+        AssertTrue(string.Equals(expected, actual, StringComparison.Ordinal), message);
 
     private static void AssertSession(AuthSession session)
     {
-        AssertEqual("access-result", session.AccessToken, "access token should be parsed");
-        AssertEqual("refresh-result", session.RefreshToken, "refresh token should be parsed");
+        AssertSecretEqual("access-result", session.AccessToken, "access token should be parsed");
+        AssertSecretEqual("refresh-result", session.RefreshToken, "refresh token should be parsed");
         AssertEqual("user-result", session.UserId, "user ID should be parsed");
         AssertEqual("Catpaw User", session.AccountLabel, "account label should be parsed");
         AssertEqual(Tenant, session.Tenant, "client tenant should be assigned");
@@ -374,18 +629,26 @@ internal static class CatpawAuthClientTests
 
     private static ClientFixture Fixture(
         Func<HttpRequestMessage, Task<HttpResponseMessage>> response,
-        TimeSpan? timeout = null) => Fixture((request, _) => response(request), timeout);
+        TimeSpan? httpTimeout = null,
+        TimeSpan? operationTimeout = null,
+        Uri? baseAddress = null) => Fixture(
+            (request, _) => response(request), httpTimeout, operationTimeout, baseAddress);
 
     private static ClientFixture Fixture(
         Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> response,
-        TimeSpan? timeout = null)
+        TimeSpan? httpTimeout = null,
+        TimeSpan? operationTimeout = null,
+        Uri? baseAddress = null)
     {
         var http = new HttpClient(new DelegateHandler(response))
         {
-            BaseAddress = new Uri("https://catpaw.meituan.com"),
-            Timeout = timeout ?? TimeSpan.FromSeconds(31),
+            BaseAddress = baseAddress ?? new Uri("https://catpaw.meituan.com"),
+            Timeout = httpTimeout ?? TimeSpan.FromSeconds(31),
         };
-        return new ClientFixture(http, new CatpawAuthClient(http, Tenant));
+        var client = operationTimeout is null
+            ? new CatpawAuthClient(http, Tenant)
+            : new CatpawAuthClient(http, Tenant, operationTimeout.Value);
+        return new ClientFixture(http, client);
     }
 
     private sealed record ClientFixture(HttpClient Http, CatpawAuthClient Client) : IDisposable
