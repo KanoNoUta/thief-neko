@@ -206,6 +206,47 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         }
     }
 
+    public async Task<BrokerCredentialSnapshot> GetBrokerSnapshotAsync(
+        CancellationToken ct = default)
+    {
+        await GetSessionAsync(ct);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            return CreateBrokerSnapshotLocked();
+        }
+    }
+
+    public async Task<BrokerCredentialSnapshot> RefreshBrokerSnapshotAsync(
+        string usedToken,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(usedToken);
+        await GetSessionAsync(ct);
+        Task<AuthSession>? refresh = null;
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            var current = _session
+                ?? throw new InvalidOperationException("Catpaw login is required.");
+            if (string.Equals(current.AccessToken, usedToken, StringComparison.Ordinal))
+            {
+                refresh = RefreshAsync(true, ct);
+            }
+        }
+
+        if (refresh is not null)
+        {
+            await refresh;
+        }
+
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            return CreateBrokerSnapshotLocked();
+        }
+    }
+
     public async Task StartAsync(CancellationToken ct = default)
     {
         await GetSessionAsync(ct);
@@ -276,6 +317,19 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         }
 
         schedulerCancellation.Dispose();
+    }
+
+    private BrokerCredentialSnapshot CreateBrokerSnapshotLocked()
+    {
+        var session = _session
+            ?? throw new InvalidOperationException("Catpaw login is required.");
+        var cookie = $"1d47d6ff96_passportid={session.AccessToken}; " +
+            $"f32a546874_ssoid={session.AccessToken}";
+        return new BrokerCredentialSnapshot(
+            session.AccessToken,
+            session.UserId,
+            cookie,
+            _sessionGeneration);
     }
 
     public ValueTask DisposeAsync()

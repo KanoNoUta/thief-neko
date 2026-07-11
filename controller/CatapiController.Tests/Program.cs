@@ -18,6 +18,7 @@ var tests = new List<(string Name, Func<Task> Run)>
 tests.AddRange(AuthSessionStoreTests.All());
 tests.AddRange(CatpawAuthClientTests.All());
 tests.AddRange(CatpawAuthServiceTests.All());
+tests.AddRange(CredentialPipeServerTests.All());
 
 foreach (var test in tests)
 {
