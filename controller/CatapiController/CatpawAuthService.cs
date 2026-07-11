@@ -24,6 +24,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     private readonly TimeProvider _timeProvider;
     private readonly Func<CancellationToken, Task<AuthSession?>> _loadSession;
     private readonly Func<AuthSession, CancellationToken, Task> _saveSession;
+    private readonly Func<CancellationToken, Task> _beforeFailureStatusMutation;
     private readonly SemaphoreSlim _mutationGate = new(1, 1);
     private readonly object _sync = new();
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -49,7 +50,8 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         Func<TimeSpan, CancellationToken, Task>? delay = null,
         TimeProvider? timeProvider = null,
         Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
-        Func<AuthSession, CancellationToken, Task>? saveSession = null)
+        Func<AuthSession, CancellationToken, Task>? saveSession = null,
+        Func<CancellationToken, Task>? beforeFailureStatusMutation = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         ArgumentNullException.ThrowIfNull(store);
@@ -59,6 +61,8 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         _loadSession = loadSession ?? store.LoadAsync;
         _saveSession = saveSession ?? store.SaveAsync;
+        _beforeFailureStatusMutation = beforeFailureStatusMutation
+            ?? (_ => Task.CompletedTask);
     }
 
     public async Task<AuthSession?> GetSessionAsync(CancellationToken ct = default)
@@ -395,55 +399,42 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             catch (CatpawAuthException error)
                 when (error.Kind == CatpawAuthFailureKind.AuthRejected)
             {
-                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
-                if (superseding.Changed)
+                await _beforeFailureStatusMutation(ct);
+                var superseding = TrySetFailureStatus(
+                    baseGeneration,
+                    new AuthStatus(false, current.AccountLabel, "LoginRequired"),
+                    signalSessionChange: true);
+                if (superseding is not null)
                 {
-                    return new RefreshOutcome(
-                        superseding.Session ?? throw new InvalidOperationException(
-                            "Catpaw login is required."),
-                        true);
-                }
-
-                lock (_sync)
-                {
-                    _status = new AuthStatus(false, current.AccountLabel, "LoginRequired");
-                    SignalSessionChangedLocked();
+                    return superseding;
                 }
 
                 throw RedactedRefreshFailure(error.Kind);
             }
             catch (Exception error) when (IsTransient(error) && attempt < RetryDelays.Length)
             {
-                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
-                if (superseding.Changed)
+                await _beforeFailureStatusMutation(ct);
+                var superseding = TrySetFailureStatus(
+                    baseGeneration,
+                    new AuthStatus(true, current.AccountLabel, "RefreshPending"),
+                    signalSessionChange: false);
+                if (superseding is not null)
                 {
-                    return new RefreshOutcome(
-                        superseding.Session ?? throw new InvalidOperationException(
-                            "Catpaw login is required."),
-                        true);
-                }
-
-                lock (_sync)
-                {
-                    _status = new AuthStatus(true, current.AccountLabel, "RefreshPending");
+                    return superseding;
                 }
 
                 await _delay(RetryDelays[attempt], ct);
             }
             catch (Exception error) when (IsTransient(error))
             {
-                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
-                if (superseding.Changed)
+                await _beforeFailureStatusMutation(ct);
+                var superseding = TrySetFailureStatus(
+                    baseGeneration,
+                    new AuthStatus(true, current.AccountLabel, "RefreshPending"),
+                    signalSessionChange: false);
+                if (superseding is not null)
                 {
-                    return new RefreshOutcome(
-                        superseding.Session ?? throw new InvalidOperationException(
-                            "Catpaw login is required."),
-                        true);
-                }
-
-                lock (_sync)
-                {
-                    _status = new AuthStatus(true, current.AccountLabel, "RefreshPending");
+                    return superseding;
                 }
 
                 throw RedactedRefreshFailure(CatpawAuthFailureKind.Transient);
@@ -461,6 +452,32 @@ internal sealed class CatpawAuthService : IAsyncDisposable
 
                 throw RedactedRefreshFailure(error.Kind);
             }
+        }
+    }
+
+    private RefreshOutcome? TrySetFailureStatus(
+        long baseGeneration,
+        AuthStatus status,
+        bool signalSessionChange)
+    {
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            if (_sessionGeneration != baseGeneration)
+            {
+                return new RefreshOutcome(
+                    _session ?? throw new InvalidOperationException(
+                        "Catpaw login is required."),
+                    true);
+            }
+
+            _status = status;
+            if (signalSessionChange)
+            {
+                SignalSessionChangedLocked();
+            }
+
+            return null;
         }
     }
 

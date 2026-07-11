@@ -45,6 +45,10 @@ internal static class CatpawAuthServiceTests
             NewerLoginDiscardsStaleAuthRejectionAsync);
         yield return ("Catpaw auth service newer login cancels stale retry delay",
             NewerLoginPreventsStaleRetryAsync);
+        yield return ("Catpaw auth service login wins auth failure status race",
+            LoginWinsAuthFailureStatusRaceAsync);
+        yield return ("Catpaw auth service login wins transient failure status race",
+            LoginWinsTransientFailureStatusRaceAsync);
         yield return ("Catpaw auth scheduler stays alive while signed out",
             SchedulerWakesWhenLoginIsSavedAsync);
         yield return ("Catpaw auth scheduler wakes for earlier replacement expiry",
@@ -683,6 +687,65 @@ internal static class CatpawAuthServiceTests
             "newer login during retry delay should prevent another stale request");
     }
 
+    private static async Task LoginWinsAuthFailureStatusRaceAsync()
+    {
+        await LoginWinsFailureStatusRaceAsync(
+            CatpawAuthFailureKind.AuthRejected,
+            "auth rejection");
+    }
+
+    private static async Task LoginWinsTransientFailureStatusRaceAsync()
+    {
+        await LoginWinsFailureStatusRaceAsync(
+            CatpawAuthFailureKind.Transient,
+            "transient failure");
+    }
+
+    private static async Task LoginWinsFailureStatusRaceAsync(
+        CatpawAuthFailureKind failureKind,
+        string scenario)
+    {
+        using var directory = new AuthTemporaryDirectory();
+        var failureChecked = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStatusMutation = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var newerLogin = Session(
+            $"{failureKind}-login-access",
+            $"{failureKind}-login-refresh");
+        var client = new FakeAuthClient
+        {
+            Refresh = (_, _) => throw new CatpawAuthException(
+                $"redacted {scenario}", failureKind),
+        };
+        var store = new AuthSessionStore(Path.Combine(directory.Path, "session.json"));
+        await using var service = Service(
+            client,
+            store,
+            delay: (_, _) => Task.CompletedTask,
+            beforeFailureStatusMutation: async ct =>
+            {
+                failureChecked.TrySetResult();
+                await releaseStatusMutation.Task.WaitAsync(ct);
+            });
+        await service.SaveLoginAsync(Session("race-base", "race-base-refresh"), default);
+
+        var refresh = service.RefreshAsync(true, default);
+        await failureChecked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await service.SaveLoginAsync(newerLogin, default);
+        releaseStatusMutation.SetResult();
+
+        AssertEqual(newerLogin, await refresh,
+            $"newer login should supersede stale {scenario}");
+        var status = service.GetStatus();
+        AssertTrue(status.SignedIn,
+            $"stale {scenario} must not mark newer login signed out or pending");
+        AssertEqual("SignedIn", status.State,
+            $"stale {scenario} must preserve newer login status");
+        AssertEqual(newerLogin, await store.LoadAsync(),
+            $"stale {scenario} must not change newer stored login");
+    }
+
     private static async Task SchedulerWakesWhenLoginIsSavedAsync()
     {
         using var directory = new AuthTemporaryDirectory();
@@ -893,11 +956,12 @@ internal static class CatpawAuthServiceTests
         Func<TimeSpan, CancellationToken, Task>? delay = null,
         TimeProvider? timeProvider = null,
         Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
-        Func<AuthSession, CancellationToken, Task>? saveSession = null) => new(
+        Func<AuthSession, CancellationToken, Task>? saveSession = null,
+        Func<CancellationToken, Task>? beforeFailureStatusMutation = null) => new(
             client, store, Tenant,
             desktopStateReader is null ? null : new DesktopStateReader(desktopStateReader),
             delay, timeProvider,
-            loadSession, saveSession);
+            loadSession, saveSession, beforeFailureStatusMutation);
 
     private static AuthSession Session(string accessToken, string refreshToken) => new(
         accessToken,
