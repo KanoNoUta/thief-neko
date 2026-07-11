@@ -7,16 +7,25 @@ test('readCatpawSessionAsync reads state through an asynchronous helper process'
   let receivedEnv;
   const result = await readCatpawSessionAsync(env, async (value) => {
     receivedEnv = value;
-    return { stdout: '{"token":"fresh-token","userMis":"user-1"}' };
+    return {
+      stdout: '{"token":"fresh-token","refreshToken":"refresh-token","userMis":"user-1","accountLabel":"Catpaw User"}',
+    };
   });
 
   assert.equal(receivedEnv, env);
-  assert.deepEqual(result, { token: 'fresh-token', userMis: 'user-1' });
+  assert.deepEqual(result, {
+    token: 'fresh-token',
+    refreshToken: 'refresh-token',
+    userMis: 'user-1',
+    accountLabel: 'Catpaw User',
+  });
 });
 
 test('readCatpawSessionAsync rejects incomplete helper output', async () => {
   await assert.rejects(
-    () => readCatpawSessionAsync({}, async () => ({ stdout: '{"token":""}' })),
+    () => readCatpawSessionAsync({}, async () => ({
+      stdout: '{"token":"token","refreshToken":"","userMis":"user","accountLabel":"User"}',
+    })),
     /incomplete/,
   );
 });

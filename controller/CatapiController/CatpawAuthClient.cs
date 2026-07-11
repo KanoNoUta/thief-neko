@@ -18,14 +18,32 @@ internal sealed record MobileVerification(bool Verified, bool InvitationCodeRequ
 
 internal sealed record AccountInfo(string UserId, string AccountLabel);
 
-internal sealed class CatpawAuthException : Exception
+internal interface ICatpawAuthClient
 {
-    public CatpawAuthException(string message) : base(message)
-    {
-    }
+    Task<AuthSession> RefreshAsync(AuthSession current, CancellationToken ct);
+    Task<AccountInfo> GetUserInfoAsync(string accessToken, CancellationToken ct);
 }
 
-internal sealed class CatpawAuthClient
+internal enum CatpawAuthFailureKind
+{
+    Protocol,
+    AuthRejected,
+    Transient,
+}
+
+internal sealed class CatpawAuthException : Exception
+{
+    public CatpawAuthException(
+        string message,
+        CatpawAuthFailureKind kind = CatpawAuthFailureKind.Protocol) : base(message)
+    {
+        Kind = kind;
+    }
+
+    public CatpawAuthFailureKind Kind { get; }
+}
+
+internal sealed class CatpawAuthClient : ICatpawAuthClient
 {
     private static readonly Uri ServiceRoot = new("https://catpaw.meituan.com");
     internal static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromSeconds(15);
@@ -220,7 +238,10 @@ internal sealed class CatpawAuthClient
                 request, HttpCompletionOption.ResponseHeadersRead, operationToken);
             if (!response.IsSuccessStatusCode)
             {
-                throw Failure(operation, $"HTTP status {(int)response.StatusCode}");
+                var kind = (int)response.StatusCode >= 500
+                    ? CatpawAuthFailureKind.Transient
+                    : CatpawAuthFailureKind.AuthRejected;
+                throw Failure(operation, $"HTTP status {(int)response.StatusCode}", kind);
             }
 
             try
@@ -238,7 +259,8 @@ internal sealed class CatpawAuthClient
 
                 if (logicalCode != 0)
                 {
-                    throw Failure(operation, $"logical code {logicalCode}");
+                    throw Failure(operation, $"logical code {logicalCode}",
+                        CatpawAuthFailureKind.AuthRejected);
                 }
 
                 if (!root.TryGetProperty("data", out var data) ||
@@ -260,7 +282,7 @@ internal sealed class CatpawAuthClient
         }
         catch (OperationCanceledException) when (operationCancellation.IsCancellationRequested)
         {
-            throw Failure(operation, "timed out");
+            throw Failure(operation, "timed out", CatpawAuthFailureKind.Transient);
         }
     }
 
@@ -489,6 +511,9 @@ internal sealed class CatpawAuthClient
     private static void AddHeader(HttpRequestMessage request, string name, string value) =>
         request.Headers.TryAddWithoutValidation(name, value);
 
-    private static CatpawAuthException Failure(string operation, string reason) =>
-        new($"Catpaw authentication {operation} failed ({reason}).");
+    private static CatpawAuthException Failure(
+        string operation,
+        string reason,
+        CatpawAuthFailureKind kind = CatpawAuthFailureKind.Protocol) =>
+        new($"Catpaw authentication {operation} failed ({reason}).", kind);
 }

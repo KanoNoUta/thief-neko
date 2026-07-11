@@ -35,7 +35,9 @@ export function readCatpawSession(env = process.env) {
 
     return {
       token: session.accessToken,
+      refreshToken: auth.refreshToken || '',
       userMis: session.account.id,
+      accountLabel: session.account.label || '',
     };
   } finally {
     db.close();
@@ -48,10 +50,20 @@ export async function readCatpawSessionAsync(
 ) {
   const { stdout } = await runStateReader(env);
   const session = JSON.parse(stdout);
-  if (!session?.token || !session?.userMis) {
+  if (
+    !session?.token ||
+    !session?.refreshToken ||
+    !session?.userMis ||
+    !session?.accountLabel
+  ) {
     throw new Error('Catpaw authentication session is incomplete');
   }
-  return { token: session.token, userMis: session.userMis };
+  return {
+    token: session.token,
+    refreshToken: session.refreshToken,
+    userMis: session.userMis,
+    accountLabel: session.accountLabel,
+  };
 }
 
 async function runStateReaderProcess(env) {
