@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
 import { CredentialBroker } from '../src/credentialBroker.js';
 
@@ -37,6 +38,40 @@ test('CredentialBroker snapshot requests fresh state on every call', async () =>
   assert.equal((await broker.snapshot()).token, 'token-2');
   assert.equal(requests, 2);
   assert.equal(transport.sockets.length, 2);
+});
+
+test('CredentialBroker ignores an older snapshot that arrives after a newer generation', async () => {
+  const releases = [];
+  const transport = fakeTransport(() => new Promise((resolve) => releases.push(resolve)));
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  const older = broker.snapshot();
+  const newer = broker.snapshot();
+  await waitFor(() => releases.length === 2);
+  releases[1](okSnapshot('newer-token', 2));
+  assert.equal((await newer).token, 'newer-token');
+  releases[0](okSnapshot('older-token', 1));
+
+  assert.deepEqual(await older, {
+    token: 'newer-token',
+    userMis: 'user-1',
+    cookie: 'passport=newer-token',
+    generation: 2,
+  });
+});
+
+test('CredentialBroker rejects conflicting credentials at the same generation', async () => {
+  let request = 0;
+  const transport = fakeTransport(() => {
+    request += 1;
+    return okSnapshot(request === 1 ? 'first-token' : 'conflicting-token', 4);
+  });
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+  await broker.snapshot();
+
+  const error = await captureError(() => broker.snapshot());
+  assert.equal(error.code, 'CREDENTIAL_BROKER_MALFORMED');
+  assertSecretFree(error, 'conflicting-token');
 });
 
 test('CredentialBroker refreshes after unauthorized with the token that was used', async () => {
@@ -81,6 +116,61 @@ test('CredentialBroker coalesces refreshes and skips them after the current toke
   assert.equal(refreshRequests, 1);
 });
 
+test('CredentialBroker retries for a joiner when the shared refresh leaves its token current', async () => {
+  let releaseFirst;
+  let refreshRequests = 0;
+  const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });
+  const transport = fakeTransport(({ request }) => {
+    if (request.operation === 'snapshot') return okSnapshot(TOKEN, 1);
+    refreshRequests += 1;
+    return refreshRequests === 1
+      ? firstResponse
+      : okSnapshot('second-refresh-token', 2);
+  });
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+  await broker.snapshot();
+
+  const owner = broker.refreshAfterUnauthorized(TOKEN);
+  const joiner = broker.refreshAfterUnauthorized(TOKEN);
+  releaseFirst(okSnapshot(TOKEN, 1));
+
+  assert.deepEqual(await Promise.all([owner, joiner]), [false, true]);
+  assert.equal(refreshRequests, 2);
+});
+
+test('CredentialBroker does not join a pending refresh for a different used token', async () => {
+  let snapshotRequests = 0;
+  let releaseTokenA;
+  const refreshA = new Promise((resolve) => { releaseTokenA = resolve; });
+  const requests = [];
+  const transport = fakeTransport(({ request }) => {
+    requests.push(request);
+    if (request.operation === 'snapshot') {
+      snapshotRequests += 1;
+      return snapshotRequests === 1
+        ? okSnapshot('token-A', 1)
+        : okSnapshot(snapshotRequests === 2 ? 'token-B' : 'token-C', snapshotRequests);
+    }
+    if (request.usedToken === 'token-A') return refreshA;
+    return okSnapshot('token-C', 3);
+  });
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+  await broker.snapshot();
+
+  const first = broker.refreshAfterUnauthorized('token-A');
+  await waitFor(() => requests.some((request) => request.usedToken === 'token-A'));
+  assert.equal((await broker.snapshot()).token, 'token-B');
+  const second = broker.refreshAfterUnauthorized('token-B');
+  await waitFor(
+    () => requests.some((request) => request.operation === 'refresh' && request.usedToken === 'token-B'),
+    100,
+  );
+  assert.equal(await second, true);
+  releaseTokenA(okSnapshot('token-B', 2));
+  assert.equal(await first, true);
+  assert.equal((await broker.snapshot()).token, 'token-C');
+});
+
 test('CredentialBroker destroys a timed out socket and redacts the error', async () => {
   const transport = fakeTransport(() => new Promise(() => {}));
   const broker = new CredentialBroker({
@@ -105,6 +195,46 @@ test('CredentialBroker rejects malformed responses without retaining raw content
   assert.equal(error.code, 'CREDENTIAL_BROKER_MALFORMED');
   assert.equal(transport.sockets[0].destroyed, true);
   assertSecretFree(error, raw);
+});
+
+test('CredentialBroker parses a snapshot fragmented across arbitrary chunks', async () => {
+  const payload = Buffer.from(JSON.stringify(okSnapshot('fragmented-token', 8)), 'utf8');
+  const chunks = [
+    payload.subarray(0, 1),
+    payload.subarray(1, 7),
+    payload.subarray(7),
+    Buffer.from('\n'),
+  ].map((chunk) => Buffer.from(chunk));
+  const transport = fakeTransport(() => ({ rawChunks: chunks }));
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  assert.equal((await broker.snapshot()).token, 'fragmented-token');
+});
+
+test('CredentialBroker rejects a connection closed before a complete frame', async () => {
+  const transport = fakeTransport(() => ({
+    rawChunks: [Buffer.from('{"ok":true')],
+    end: true,
+  }));
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  const error = await captureError(() => broker.snapshot());
+  assert.equal(error.code, 'CREDENTIAL_BROKER_MALFORMED');
+  assertSecretFree(error);
+});
+
+test('CredentialBroker rejects invalid UTF-8 as malformed', async () => {
+  const invalid = Buffer.from([
+    0x7b, 0x22, 0x6f, 0x6b, 0x22, 0x3a, 0x66, 0x61, 0x6c, 0x73, 0x65,
+    0x2c, 0x22, 0x65, 0x72, 0x72, 0x6f, 0x72, 0x22, 0x3a, 0x22,
+    0xc3, 0x28, 0x22, 0x7d, 0x0a,
+  ]);
+  const transport = fakeTransport(() => ({ rawChunks: [invalid] }));
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  const error = await captureError(() => broker.snapshot());
+  assert.equal(error.code, 'CREDENTIAL_BROKER_MALFORMED');
+  assertSecretFree(error);
 });
 
 test('CredentialBroker redacts unauthorized server responses', async () => {
@@ -145,6 +275,28 @@ test('CredentialBroker rejects oversized responses and destroys the socket', asy
   assertSecretFree(error);
 });
 
+test('CredentialBroker counts inbound payload bytes excluding the newline', async () => {
+  const exactPayload = paddedErrorPayload(16 * 1024);
+  const exactTransport = fakeTransport(() => exactPayload);
+  const exactBroker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: NONCE,
+    connect: exactTransport.connect,
+  });
+  const exactError = await captureError(() => exactBroker.snapshot());
+  assert.equal(exactError.code, 'CREDENTIAL_BROKER_REJECTED');
+
+  const oversizedPayload = paddedErrorPayload((16 * 1024) + 1);
+  const oversizedTransport = fakeTransport(() => oversizedPayload);
+  const oversizedBroker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: NONCE,
+    connect: oversizedTransport.connect,
+  });
+  const oversizedError = await captureError(() => oversizedBroker.snapshot());
+  assert.equal(oversizedError.code, 'CREDENTIAL_BROKER_OVERSIZE');
+});
+
 test('CredentialBroker rejects oversized outbound frames before connecting', async () => {
   const oversizedNonce = `outbound-secret-${'x'.repeat(16 * 1024)}`;
   let connectCalls = 0;
@@ -161,6 +313,68 @@ test('CredentialBroker rejects oversized outbound frames before connecting', asy
   assert.equal(error.code, 'CREDENTIAL_BROKER_OVERSIZE');
   assert.equal(connectCalls, 0);
   assert.equal(`${error.message} ${error.stack}`.includes(oversizedNonce), false);
+});
+
+test('CredentialBroker counts outbound payload bytes excluding the newline', async () => {
+  const baseBytes = Buffer.byteLength(JSON.stringify({ nonce: '', operation: 'snapshot' }));
+  const exactNonce = 'n'.repeat((16 * 1024) - baseBytes);
+  const exactTransport = fakeTransport(() => okSnapshot('exact-token', 1));
+  const exactBroker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: exactNonce,
+    connect: exactTransport.connect,
+  });
+  assert.equal((await exactBroker.snapshot()).token, 'exact-token');
+  assert.equal(exactTransport.sockets.length, 1);
+
+  let oversizedConnects = 0;
+  const oversizedBroker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: `${exactNonce}n`,
+    connect: () => {
+      oversizedConnects += 1;
+      throw new Error('connector must not run');
+    },
+  });
+  const error = await captureError(() => oversizedBroker.snapshot());
+  assert.equal(error.code, 'CREDENTIAL_BROKER_OVERSIZE');
+  assert.equal(oversizedConnects, 0);
+});
+
+test('CredentialBroker zeroes outbound bytes only after the async write callback', async () => {
+  const socket = new ManualWriteSocket(okSnapshot('write-token', 1));
+  const broker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: NONCE,
+    connect: () => socket,
+  });
+
+  assert.equal((await broker.snapshot()).token, 'write-token');
+  assert.equal(socket.frame.some((byte) => byte !== 0), true);
+  socket.completeWrite();
+  assert.equal(socket.frame.every((byte) => byte === 0), true);
+});
+
+test('CredentialBroker zeroes outbound bytes when a destroyed socket closes', async () => {
+  const socket = new ManualWriteSocket(okSnapshot('close-token', 1), true);
+  const broker = new CredentialBroker({
+    pipeName: PIPE_NAME,
+    nonce: NONCE,
+    connect: () => socket,
+  });
+
+  assert.equal((await broker.snapshot()).token, 'close-token');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.frame.every((byte) => byte === 0), true);
+});
+
+test('CredentialBroker zeroes inbound source buffers after parsing', async () => {
+  const response = Buffer.from(`${JSON.stringify(okSnapshot('zeroed-token', 1))}\n`, 'utf8');
+  const transport = fakeTransport(() => ({ rawChunks: [response] }));
+  const broker = new CredentialBroker({ pipeName: PIPE_NAME, nonce: NONCE, connect: transport.connect });
+
+  assert.equal((await broker.snapshot()).token, 'zeroed-token');
+  assert.equal(response.every((byte) => byte === 0), true);
 });
 
 test('CredentialBroker start and stop own one unrefed polling timer', () => {
@@ -234,6 +448,11 @@ class FakeSocket extends Duplex {
     Promise.resolve(this.respond({ path: this.path, request, socket: this }))
       .then((response) => {
         if (this.destroyed) return;
+        if (response?.rawChunks) {
+          for (const chunk of response.rawChunks) this.push(chunk);
+          if (response.end) this.push(null);
+          return;
+        }
         const raw = typeof response === 'string' ? response : JSON.stringify(response);
         this.push(`${raw}\n`);
       })
@@ -244,6 +463,38 @@ class FakeSocket extends Duplex {
     this.destroyCalls += 1;
     callback(error);
   }
+}
+
+class ManualWriteSocket extends EventEmitter {
+  constructor(response, emitCloseOnDestroy = false) {
+    super();
+    this.response = response;
+    this.emitCloseOnDestroy = emitCloseOnDestroy;
+    this.destroyed = false;
+    queueMicrotask(() => this.emit('connect'));
+  }
+
+  write(frame, callback) {
+    this.frame = frame;
+    this.writeCallback = callback;
+    queueMicrotask(() => this.emit('data', Buffer.from(`${JSON.stringify(this.response)}\n`)));
+    return true;
+  }
+
+  completeWrite() {
+    this.writeCallback();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    if (this.emitCloseOnDestroy) queueMicrotask(() => this.emit('close'));
+  }
+}
+
+function paddedErrorPayload(length) {
+  const prefix = '{"ok":false,"error":"unknown","padding":"';
+  const suffix = '"}';
+  return `${prefix}${'x'.repeat(length - Buffer.byteLength(prefix) - Buffer.byteLength(suffix))}${suffix}`;
 }
 
 function assertSecretFree(error, raw = '') {
@@ -260,4 +511,12 @@ async function captureError(action) {
     return error;
   }
   assert.fail('expected action to reject');
+}
+
+async function waitFor(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail('condition was not met before timeout');
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
 }

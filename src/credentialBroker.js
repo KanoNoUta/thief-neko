@@ -3,6 +3,7 @@ import net from 'node:net';
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const STRICT_UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export class CredentialBroker {
   constructor({
@@ -38,14 +39,13 @@ export class CredentialBroker {
     this.setIntervalFn = setIntervalFn;
     this.clearIntervalFn = clearIntervalFn;
     this.cachedCurrent = { token: '', userMis: '', cookie: '', generation: 0 };
-    this.refreshPromise = null;
+    this.refreshes = new Map();
     this.timer = null;
   }
 
   async snapshot() {
     const snapshot = await this.#request({ operation: 'snapshot' });
-    this.#apply(snapshot);
-    return { ...this.cachedCurrent };
+    return this.#apply(snapshot);
   }
 
   async poll() {
@@ -58,19 +58,16 @@ export class CredentialBroker {
     if (this.cachedCurrent.token !== usedToken) {
       return true;
     }
-    if (this.refreshPromise) {
-      return this.refreshPromise;
+    const active = this.refreshes.get(usedToken);
+    if (active) {
+      await active;
+      if (this.cachedCurrent.token !== usedToken) {
+        return true;
+      }
+      return this.#getOrStartRefresh(usedToken);
     }
 
-    const refresh = this.#refresh(usedToken);
-    this.refreshPromise = refresh;
-    try {
-      return await refresh;
-    } finally {
-      if (this.refreshPromise === refresh) {
-        this.refreshPromise = null;
-      }
-    }
+    return this.#getOrStartRefresh(usedToken);
   }
 
   start() {
@@ -94,9 +91,23 @@ export class CredentialBroker {
     return this.cachedCurrent.token !== usedToken;
   }
 
+  #getOrStartRefresh(usedToken) {
+    const active = this.refreshes.get(usedToken);
+    if (active) return active;
+
+    let tracked;
+    tracked = this.#refresh(usedToken).finally(() => {
+      if (this.refreshes.get(usedToken) === tracked) {
+        this.refreshes.delete(usedToken);
+      }
+    });
+    this.refreshes.set(usedToken, tracked);
+    return tracked;
+  }
+
   #apply(snapshot) {
     if (snapshot.generation < this.cachedCurrent.generation) {
-      throw brokerError('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
+      return { ...this.cachedCurrent };
     }
     if (snapshot.generation === this.cachedCurrent.generation
       && this.cachedCurrent.token
@@ -104,25 +115,33 @@ export class CredentialBroker {
       throw brokerError('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
     }
     this.cachedCurrent = snapshot;
+    return { ...this.cachedCurrent };
   }
 
   #request(payload) {
-    const frame = Buffer.from(
-      `${JSON.stringify({ nonce: this.nonce, ...payload })}\n`,
+    const encodedPayload = Buffer.from(
+      JSON.stringify({ nonce: this.nonce, ...payload }),
       'utf8',
     );
-    if (frame.length > MAX_MESSAGE_BYTES) {
+    if (encodedPayload.length > MAX_MESSAGE_BYTES) {
+      encodedPayload.fill(0);
       return Promise.reject(
         brokerError('CREDENTIAL_BROKER_OVERSIZE', 'request was oversized'),
       );
     }
+    const frame = Buffer.allocUnsafe(encodedPayload.length + 1);
+    encodedPayload.copy(frame);
+    frame[frame.length - 1] = 0x0a;
+    encodedPayload.fill(0);
 
     return new Promise((resolve, reject) => {
       let socket;
       let settled = false;
       let sent = false;
+      let writeStarted = false;
       let receivedBytes = 0;
-      const chunks = [];
+      const inbound = Buffer.allocUnsafe(MAX_MESSAGE_BYTES);
+      const zeroFrame = () => frame.fill(0);
 
       const finish = (error, value) => {
         if (settled) return;
@@ -133,6 +152,8 @@ export class CredentialBroker {
         socket?.removeListener('error', onError);
         socket?.removeListener('end', onEnd);
         socket?.destroy();
+        inbound.fill(0);
+        if (!writeStarted) zeroFrame();
         if (error) reject(error);
         else resolve(value);
       };
@@ -142,46 +163,59 @@ export class CredentialBroker {
         if (sent || settled) return;
         sent = true;
         try {
-          socket.write(frame);
+          writeStarted = true;
+          socket.write(frame, (error) => {
+            zeroFrame();
+            if (error && !settled) {
+              fail('CREDENTIAL_BROKER_TRANSPORT', 'transport failed');
+            }
+          });
         } catch {
+          zeroFrame();
           fail('CREDENTIAL_BROKER_TRANSPORT', 'transport failed');
         }
       };
       const onData = (chunk) => {
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        receivedBytes += bytes.length;
-        if (receivedBytes > MAX_MESSAGE_BYTES) {
-          fail('CREDENTIAL_BROKER_OVERSIZE', 'response was oversized');
-          return;
-        }
-        chunks.push(bytes);
-        const combined = Buffer.concat(chunks, receivedBytes);
-        const newline = combined.indexOf(0x0a);
-        if (newline < 0) return;
-
-        let response;
         try {
-          response = JSON.parse(combined.subarray(0, newline).toString('utf8'));
-        } catch {
-          fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
-          return;
-        }
-        if (!response || typeof response !== 'object' || Array.isArray(response)) {
-          fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
-          return;
-        }
-        if (response.ok !== true) {
-          const mapped = mapServerError(response.error);
-          fail(mapped.code, mapped.label);
-          return;
-        }
+          const newline = bytes.indexOf(0x0a);
+          const payloadBytes = newline < 0 ? bytes.length : newline;
+          if (receivedBytes + payloadBytes > MAX_MESSAGE_BYTES) {
+            fail('CREDENTIAL_BROKER_OVERSIZE', 'response was oversized');
+            return;
+          }
+          bytes.copy(inbound, receivedBytes, 0, payloadBytes);
+          receivedBytes += payloadBytes;
+          if (newline < 0) return;
 
-        const snapshot = normalizeSnapshot(response.snapshot);
-        if (!snapshot) {
-          fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
-          return;
+          let response;
+          try {
+            response = JSON.parse(
+              STRICT_UTF8_DECODER.decode(inbound.subarray(0, receivedBytes)),
+            );
+          } catch {
+            fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
+            return;
+          }
+          if (!response || typeof response !== 'object' || Array.isArray(response)) {
+            fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
+            return;
+          }
+          if (response.ok !== true) {
+            const mapped = mapServerError(response.error);
+            fail(mapped.code, mapped.label);
+            return;
+          }
+
+          const snapshot = normalizeSnapshot(response.snapshot);
+          if (!snapshot) {
+            fail('CREDENTIAL_BROKER_MALFORMED', 'response was malformed');
+            return;
+          }
+          finish(null, snapshot);
+        } finally {
+          bytes.fill(0);
         }
-        finish(null, snapshot);
       };
       const onError = () => fail('CREDENTIAL_BROKER_TRANSPORT', 'transport failed');
       const onEnd = () => {
@@ -200,6 +234,7 @@ export class CredentialBroker {
           return;
         }
         socket.once('connect', send);
+        socket.once('close', zeroFrame);
         socket.on('data', onData);
         socket.once('error', onError);
         socket.once('end', onEnd);

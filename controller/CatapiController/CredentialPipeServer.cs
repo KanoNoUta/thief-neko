@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Cryptography;
@@ -9,11 +8,12 @@ namespace CatapiController;
 
 internal sealed class CredentialPipeServer : IAsyncDisposable
 {
-    internal const int MaxMessageBytes = 16 * 1024;
+    internal const int MaxMessageBytes = CredentialPipeFrameCodec.MaxPayloadBytes;
 
-    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly CatpawAuthService _authService;
+    private readonly CredentialPipeFrameCodec _frameCodec = new();
     private readonly TimeSpan _operationTimeout;
+    private readonly Func<string, NamedPipeServerStream> _pipeFactory;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly object _sync = new();
     private readonly HashSet<Task> _connections = [];
@@ -23,7 +23,8 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
 
     internal CredentialPipeServer(
         CatpawAuthService authService,
-        TimeSpan? operationTimeout = null)
+        TimeSpan? operationTimeout = null,
+        Func<string, NamedPipeServerStream>? pipeFactory = null)
     {
         _authService = authService ?? throw new ArgumentNullException(nameof(authService));
         _operationTimeout = operationTimeout ?? TimeSpan.FromSeconds(2);
@@ -31,6 +32,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         {
             throw new ArgumentOutOfRangeException(nameof(operationTimeout));
         }
+        _pipeFactory = pipeFactory ?? CreatePipe;
 
         PipeName = $"catapi-credential-{Guid.NewGuid():N}";
         Nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
@@ -38,13 +40,29 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
 
     internal string PipeName { get; }
     internal string Nonce { get; }
+    internal Task Completion
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _acceptLoop ?? Task.CompletedTask;
+            }
+        }
+    }
 
     internal Task StartAsync()
     {
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _acceptLoop ??= AcceptConnectionsAsync(_lifetimeCancellation.Token);
+            if (_acceptLoop is null)
+            {
+                var firstListener = _pipeFactory(PipeName);
+                _acceptLoop = AcceptConnectionsAsync(
+                    firstListener,
+                    _lifetimeCancellation.Token);
+            }
         }
 
         return Task.CompletedTask;
@@ -66,43 +84,48 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
         }
     }
 
-    private async Task AcceptConnectionsAsync(CancellationToken ct)
+    private async Task AcceptConnectionsAsync(
+        NamedPipeServerStream listener,
+        CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested)
+        while (true)
         {
-            var pipe = new NamedPipeServerStream(
-                PipeName,
-                PipeDirection.InOut,
-                NamedPipeServerStream.MaxAllowedServerInstances,
-                PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
             try
             {
-                await pipe.WaitForConnectionAsync(ct);
+                await listener.WaitForConnectionAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                await pipe.DisposeAsync();
-                break;
+                await listener.DisposeAsync();
+                return;
             }
             catch
             {
-                await pipe.DisposeAsync();
-                if (!ct.IsCancellationRequested)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(25), ct);
-                }
-                continue;
+                await listener.DisposeAsync();
+                throw;
             }
 
-            var connection = HandleConnectionAsync(pipe, ct);
+            var connection = HandleConnectionAsync(listener, ct);
             lock (_sync)
             {
                 _connections.Add(connection);
             }
             _ = ObserveConnectionAsync(connection);
+            if (ct.IsCancellationRequested)
+            {
+                return;
+            }
+
+            listener = _pipeFactory(PipeName);
         }
     }
+
+    private static NamedPipeServerStream CreatePipe(string pipeName) => new(
+        pipeName,
+        PipeDirection.InOut,
+        NamedPipeServerStream.MaxAllowedServerInstances,
+        PipeTransmissionMode.Byte,
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
 
     private async Task ObserveConnectionAsync(Task connection)
     {
@@ -132,22 +155,22 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
             timeout.CancelAfter(_operationTimeout);
             try
             {
-                var requestLine = await ReadLineAsync(pipe, timeout.Token);
-                if (requestLine.TooLarge)
+                var request = await _frameCodec.ReadAsync(pipe, timeout.Token);
+                if (request.Status == CredentialPipeFrameStatus.Oversize)
                 {
                     await WriteAsync(pipe, Error("oversize"),
                         timeout.Token);
                     return;
                 }
 
-                if (requestLine.Value is null)
+                if (request.Status != CredentialPipeFrameStatus.Complete)
                 {
                     await WriteAsync(pipe, Error("malformed"),
                         timeout.Token);
                     return;
                 }
 
-                var response = await ProcessAsync(requestLine.Value, timeout.Token);
+                var response = await ProcessAsync(request.Value!, timeout.Token);
                 await WriteAsync(pipe, response, timeout.Token);
             }
             catch (OperationCanceledException) when (lifetimeToken.IsCancellationRequested)
@@ -262,62 +285,26 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
             (value = property.GetString() ?? string.Empty).Length > 0;
     }
 
-    private static async Task<(string? Value, bool TooLarge)> ReadLineAsync(
-        Stream stream,
-        CancellationToken ct)
-    {
-        var rented = ArrayPool<byte>.Shared.Rent(1024);
-        try
-        {
-            using var collected = new MemoryStream();
-            while (true)
-            {
-                var count = await stream.ReadAsync(rented.AsMemory(0, 1024), ct);
-                if (count == 0)
-                {
-                    return (null, false);
-                }
-
-                var newline = rented.AsSpan(0, count).IndexOf((byte)'\n');
-                var appendCount = newline >= 0 ? newline : count;
-                if (collected.Length + appendCount > MaxMessageBytes)
-                {
-                    return (null, true);
-                }
-
-                collected.Write(rented, 0, appendCount);
-                if (newline >= 0)
-                {
-                    try
-                    {
-                        return (StrictUtf8.GetString(collected.GetBuffer(), 0,
-                            checked((int)collected.Length)), false);
-                    }
-                    catch (DecoderFallbackException)
-                    {
-                        return (null, false);
-                    }
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rented);
-        }
-    }
-
     private static async Task WriteAsync(Stream stream, object response, CancellationToken ct)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(response);
-        if (bytes.Length + 1 > MaxMessageBytes)
+        if (bytes.Length > MaxMessageBytes)
         {
+            CryptographicOperations.ZeroMemory(bytes);
             bytes = JsonSerializer.SerializeToUtf8Bytes(
                 Error("internal_error"));
         }
 
-        await stream.WriteAsync(bytes, ct);
-        await stream.WriteAsync("\n"u8.ToArray(), ct);
-        await stream.FlushAsync(ct);
+        try
+        {
+            await stream.WriteAsync(bytes, ct);
+            await stream.WriteAsync("\n"u8.ToArray(), ct);
+            await stream.FlushAsync(ct);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+        }
     }
 
     private static async Task TryWriteErrorAsync(
@@ -344,7 +331,7 @@ internal sealed class CredentialPipeServer : IAsyncDisposable
             {
                 await acceptLoop;
             }
-            catch (OperationCanceledException)
+            catch
             {
             }
         }
