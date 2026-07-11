@@ -2,6 +2,13 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_REFRESH_ATTEMPTS = 3;
 const DEFAULT_REFRESH_DELAY_MS = 250;
 
+export async function getCredentialSnapshot(provider) {
+  if (!provider) {
+    return null;
+  }
+  return provider.snapshot();
+}
+
 export class CatpawCredentialManager {
   constructor({
     token,

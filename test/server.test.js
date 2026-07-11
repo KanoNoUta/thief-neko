@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createGatewayServer } from '../src/server.js';
+import { createGatewayServer, createCredentialProvider } from '../src/server.js';
 import { CatpawCredentialManager } from '../src/catpawCredentials.js';
+import { CredentialBroker } from '../src/credentialBroker.js';
 import { UsageStore } from '../src/usageStore.js';
 
 test('gateway uses Catpaw native Agent protocol for a complete Claude tool loop', async (t) => {
@@ -159,6 +160,164 @@ test('gateway uses Catpaw native Agent protocol for tool-free auxiliary requests
   );
 });
 
+test('credential provider selection prefers broker, then SQLite, then manual headers', () => {
+  const broker = createCredentialProvider({
+    credentialPipe: 'catapi-credential-pipe',
+    credentialNonce: 'launch-secret',
+    autoRefreshToken: true,
+    extraHeaders: { 'Catpaw-Auth': 'legacy-token' },
+  });
+  const tokenlessBroker = createCredentialProvider({
+    credentialPipe: 'catapi-tokenless-pipe',
+    credentialNonce: 'tokenless-launch-secret',
+    extraHeaders: {},
+  });
+  const sqlite = createCredentialProvider({
+    autoRefreshToken: true,
+    extraHeaders: { 'Catpaw-Auth': 'legacy-token' },
+  });
+  const manual = createCredentialProvider({
+    autoRefreshToken: false,
+    extraHeaders: { 'Catpaw-Auth': 'manual-token' },
+  });
+
+  assert.ok(broker instanceof CredentialBroker);
+  assert.ok(tokenlessBroker instanceof CredentialBroker);
+  assert.ok(sqlite instanceof CatpawCredentialManager);
+  assert.equal(manual, null);
+});
+
+test('gateway awaits a broker snapshot before the first upstream attempt', async (t) => {
+  let upstreamToken;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    upstreamToken = req.headers['catpaw-auth'];
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"first","content":"BROKER_FIRST_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  let snapshots = 0;
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => {
+      snapshots += 1;
+      return credential('broker-token', 'broker-user', 1);
+    },
+  });
+  const gateway = createTestGateway(upstream, credentialProvider);
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('first snapshot'));
+
+  assert.match(response, /BROKER_FIRST_OK/);
+  assert.equal(upstreamToken, 'broker-token');
+  assert.equal(snapshots, 1);
+});
+
+test('gateway rebuilds encrypted headers and body for one broker replay', async (t) => {
+  const attempts = [];
+  const upstream = http.createServer(async (req, res) => {
+    const encryptedBody = await readText(req);
+    attempts.push({
+      token: req.headers['catpaw-auth'],
+      encryptedKey: req.headers['encrypted-key'],
+      encryptedBody,
+    });
+    if (attempts.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"status":401}');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"replay","content":"BROKER_REPLAY_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  let current = credential('old-broker-token', 'old-user', 1);
+  let snapshots = 0;
+  let refreshes = 0;
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => {
+      snapshots += 1;
+      return { ...current };
+    },
+    refreshAfterUnauthorized: async (usedToken) => {
+      refreshes += 1;
+      assert.equal(usedToken, 'old-broker-token');
+      current = credential('new-broker-token', 'new-user', 2);
+      return true;
+    },
+  });
+  const gateway = createTestGateway(upstream, credentialProvider, { encrypt: true });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('encrypted replay'));
+
+  assert.match(response, /BROKER_REPLAY_OK/);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(({ token }) => token), ['old-broker-token', 'new-broker-token']);
+  assert.notEqual(attempts[0].encryptedKey, attempts[1].encryptedKey);
+  assert.notEqual(attempts[0].encryptedBody, attempts[1].encryptedBody);
+  assert.equal(snapshots, 2);
+  assert.equal(refreshes, 1);
+});
+
+test('concurrent same-token 401s share one broker refresh operation', async (t) => {
+  const rejected = [];
+  let attempts = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    attempts += 1;
+    if (req.headers['catpaw-auth'] === 'shared-old-token') {
+      rejected.push(res);
+      if (rejected.length === 2) {
+        for (const pending of rejected) {
+          pending.writeHead(401, { 'content-type': 'application/json' });
+          pending.end('{"status":401}');
+        }
+      }
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"shared","content":"SHARED_REFRESH_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  let current = credential('shared-old-token', 'broker-user', 1);
+  let refreshOperation;
+  let refreshOperations = 0;
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => ({ ...current }),
+    refreshAfterUnauthorized: () => {
+      if (!refreshOperation) {
+        refreshOperations += 1;
+        refreshOperation = Promise.resolve().then(() => {
+          current = credential('shared-new-token', 'broker-user', 2);
+          return true;
+        });
+      }
+      return refreshOperation;
+    },
+  });
+  const gateway = createTestGateway(upstream, credentialProvider);
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const responses = await Promise.all([
+    postJson(messageUrl(gateway), testMessage('concurrent one')),
+    postJson(messageUrl(gateway), testMessage('concurrent two')),
+  ]);
+
+  assert.equal(responses.every((body) => body.includes('SHARED_REFRESH_OK')), true);
+  assert.equal(attempts, 4);
+  assert.equal(refreshOperations, 1);
+});
+
 test('gateway refreshes Catpaw credentials and replays one unauthorized request', async (t) => {
   const attempts = [];
   const upstream = http.createServer(async (req, res) => {
@@ -264,6 +423,25 @@ test('gateway maps an unresolved Catpaw 401 to a temporary 503 without replaying
   assert.equal(attempts, 1);
 });
 
+test('gateway starts and stops the selected credential provider', async () => {
+  let starts = 0;
+  let stops = 0;
+  const credentialProvider = createAsyncCredentialProvider({
+    start: () => { starts += 1; },
+    stop: () => { stops += 1; },
+  });
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamUrl: 'http://127.0.0.1:1/unused',
+    model: 'glm-5.2',
+  }, { credentialProvider });
+
+  assert.equal(starts, 1);
+  await listen(gateway);
+  await new Promise((resolve) => gateway.close(resolve));
+  assert.equal(stops, 1);
+});
+
 test('gateway injects Claude Desktop workspace mounts and rewrites native file tool paths', async (t) => {
   const claudeSessionRoot = await createClaudeSessionRoot(t);
   const upstreamRequests = [];
@@ -331,8 +509,11 @@ test('gateway exposes sanitized local status', async (t) => {
     upstreamUrl: 'http://127.0.0.1:1/unused',
     model: 'glm-5.2',
     extraHeaders: { 'Catpaw-Auth': 'secret-token' },
+    cookie: 'passport=secret-cookie',
+    credentialPipe: 'secret-pipe',
+    credentialNonce: 'secret-nonce',
     resourceLimits: { maxAgentSessions: 128 },
-  });
+  }, { credentialProvider: createAsyncCredentialProvider() });
   await listen(gateway);
   t.after(() => gateway.close());
 
@@ -345,6 +526,9 @@ test('gateway exposes sanitized local status', async (t) => {
   assert.equal(status.sessions.maximum, 128);
   assert.equal(typeof status.memory.rssBytes, 'number');
   assert.equal(JSON.stringify(status).includes('secret-token'), false);
+  assert.equal(JSON.stringify(status).includes('secret-cookie'), false);
+  assert.equal(JSON.stringify(status).includes('secret-pipe'), false);
+  assert.equal(JSON.stringify(status).includes('secret-nonce'), false);
 });
 
 test('gateway rejects request bodies over the configured limit', async (t) => {
@@ -367,8 +551,10 @@ test('gateway rejects request bodies over the configured limit', async (t) => {
 });
 
 test('gateway status reads Catpaw quota from the user limit endpoint', async (t) => {
+  let quotaToken;
   const upstream = http.createServer((req, res) => {
     assert.equal(req.url, '/api/user/limit');
+    quotaToken = req.headers['catpaw-auth'];
     sendJson(res, {
       code: 0,
       data: {
@@ -382,13 +568,20 @@ test('gateway status reads Catpaw quota from the user limit endpoint', async (t)
   t.after(() => upstream.close());
 
   const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  let snapshots = 0;
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => {
+      snapshots += 1;
+      return credential('broker-quota-token', 'quota-user', 3);
+    },
+  });
   const gateway = createGatewayServer({
     listenHost: '127.0.0.1',
     upstreamBaseUrl: baseUrl,
     upstreamUrl: `${baseUrl}/api/gpt/openai/stream`,
     model: 'glm-5.2',
-    extraHeaders: { 'Catpaw-Auth': 'local-test' },
-  });
+    extraHeaders: { 'Catpaw-Auth': 'stale-static-token' },
+  }, { credentialProvider });
   await listen(gateway);
   t.after(() => gateway.close());
 
@@ -396,6 +589,8 @@ test('gateway status reads Catpaw quota from the user limit endpoint', async (t)
   const status = await response.json();
 
   assert.deepEqual(status.quota, { remaining: 383, used: 117, total: 500 });
+  assert.equal(quotaToken, 'broker-quota-token');
+  assert.equal(snapshots, 1);
 });
 
 test('gateway status returns persisted usage for an inclusive date range', async (t) => {
@@ -515,6 +710,53 @@ function listen(server) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 }
 
+function createAsyncCredentialProvider(overrides = {}) {
+  return {
+    snapshot: async () => credential('default-token', 'default-user', 0),
+    refreshAfterUnauthorized: async () => false,
+    start: () => {},
+    stop: () => {},
+    ...overrides,
+  };
+}
+
+function credential(token, userMis, generation) {
+  return {
+    token,
+    userMis,
+    cookie: `passport=${token}`,
+    generation,
+  };
+}
+
+function createTestGateway(upstream, credentialProvider, overrides = {}) {
+  return createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}`,
+    upstreamUrl: `http://127.0.0.1:${upstream.address().port}/api/gpt/openai/stream`,
+    model: 'glm-5.2',
+    forceStream: true,
+    nativeAgent: true,
+    userModelTypeCode: 2,
+    encrypt: false,
+    debug: false,
+    extraHeaders: {},
+    ...overrides,
+  }, { credentialProvider });
+}
+
+function messageUrl(gateway) {
+  return `http://127.0.0.1:${gateway.address().port}/v1/messages`;
+}
+
+function testMessage(content) {
+  return {
+    model: 'claude-fable-5',
+    stream: true,
+    messages: [{ role: 'user', content }],
+  };
+}
+
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: 'POST',
@@ -523,6 +765,14 @@ async function postJson(url, body) {
   });
   assert.equal(response.status, 200);
   return response.text();
+}
+
+async function readText(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 async function readJson(req) {

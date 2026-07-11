@@ -165,6 +165,31 @@ test('loadConfig enables runtime Token refresh only when requested', () => {
   assert.equal(enabled.autoRefreshToken, true);
 });
 
+test('loadConfig reads the credential broker pipe and nonce only as a pair', () => {
+  const config = loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.meituan.com',
+    CATPAW_CREDENTIAL_PIPE: 'catapi-credential-pipe',
+    CATPAW_CREDENTIAL_NONCE: 'launch-secret',
+  });
+
+  assert.equal(config.credentialPipe, 'catapi-credential-pipe');
+  assert.equal(config.credentialNonce, 'launch-secret');
+});
+
+test('loadConfig rejects missing or blank credential broker pair values', () => {
+  for (const brokerEnv of [
+    { CATPAW_CREDENTIAL_PIPE: 'catapi-credential-pipe' },
+    { CATPAW_CREDENTIAL_NONCE: 'launch-secret' },
+    { CATPAW_CREDENTIAL_PIPE: '   ', CATPAW_CREDENTIAL_NONCE: 'launch-secret' },
+    { CATPAW_CREDENTIAL_PIPE: 'catapi-credential-pipe', CATPAW_CREDENTIAL_NONCE: '  ' },
+  ]) {
+    assert.throws(() => loadConfig({
+      CATPAW_BASE_URL: 'https://catpaw.meituan.com',
+      ...brokerEnv,
+    }), /CATPAW_CREDENTIAL_PIPE.*CATPAW_CREDENTIAL_NONCE/);
+  }
+});
+
 test('loadConfig maps Catpaw user id headers', () => {
   const config = loadConfig({
     CATPAW_BASE_URL: 'https://catpaw.meituan.com',

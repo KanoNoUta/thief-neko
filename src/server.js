@@ -21,7 +21,11 @@ import {
   summarizeCatpawToolCalls,
 } from './catpawAgent.js';
 import { resolveClaudeWorkspaceContext } from './claudeWorkspace.js';
-import { CatpawCredentialManager } from './catpawCredentials.js';
+import {
+  CatpawCredentialManager,
+  getCredentialSnapshot,
+} from './catpawCredentials.js';
+import { CredentialBroker } from './credentialBroker.js';
 import { readCatpawSessionAsync } from './catpawState.js';
 import { UsageStore, formatLocalDate, parseDateKey } from './usageStore.js';
 
@@ -42,14 +46,16 @@ export function createGatewayServer(config, dependencies = {}) {
     maxSuggestMappings: limits.maxSuggestMappings,
   });
   const usageStore = config.usageStore || new UsageStore(config.usageStorePath);
-  const credentialManager = dependencies.credentialManager || createCredentialManager(config);
-  credentialManager?.start();
+  const credentialProvider = dependencies.credentialProvider
+    || dependencies.credentialManager
+    || createCredentialProvider(config);
+  credentialProvider?.start();
   const metrics = createGatewayMetrics(
     config,
     limits,
     agentSessions,
     usageStore,
-    credentialManager,
+    credentialProvider,
   );
   const server = http.createServer(async (req, res) => {
     try {
@@ -60,7 +66,7 @@ export function createGatewayServer(config, dependencies = {}) {
         limits,
         agentSessions,
         metrics,
-        credentialManager,
+        credentialProvider,
       );
     } catch (error) {
       if (res.headersSent) {
@@ -76,7 +82,7 @@ export function createGatewayServer(config, dependencies = {}) {
   server.requestTimeout = limits.upstreamTimeoutMs + 30_000;
   server.headersTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
-  server.on('close', () => credentialManager?.stop());
+  server.on('close', () => credentialProvider?.stop());
   return server;
 }
 
@@ -87,7 +93,7 @@ async function routeRequest(
   limits,
   agentSessions,
   metrics,
-  credentialManager,
+  credentialProvider,
 ) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
 
@@ -126,7 +132,7 @@ async function routeRequest(
         limits,
         agentSessions,
         metrics,
-        credentialManager,
+        credentialProvider,
       );
       metrics.completeRequest(true);
     } catch (error) {
@@ -149,7 +155,7 @@ async function handleMessages(
   limits,
   agentSessions,
   metrics,
-  credentialManager,
+  credentialProvider,
 ) {
   const anthropicRequest = await readJson(req, limits.maxRequestBytes);
   const workspaceContext = await resolveClaudeWorkspaceContext({
@@ -196,7 +202,7 @@ async function handleMessages(
     upstreamResponse = await fetchWithCredentialRefresh(
       config,
       upstreamRequest,
-      credentialManager,
+      credentialProvider,
       controller.signal,
     );
   } catch (error) {
@@ -213,7 +219,7 @@ async function handleMessages(
     await relayUpstreamError(
       res,
       upstreamResponse,
-      Boolean(credentialManager && upstreamResponse.status === 401),
+      Boolean(credentialProvider && upstreamResponse.status === 401),
     );
     return;
   }
@@ -252,7 +258,14 @@ async function handleMessages(
   sendJson(res, 200, openAIToAnthropicMessage(openAIResponse, config.model));
 }
 
-function createCredentialManager(config) {
+export function createCredentialProvider(config) {
+  if (config.credentialPipe && config.credentialNonce) {
+    return new CredentialBroker({
+      pipeName: config.credentialPipe,
+      nonce: config.credentialNonce,
+    });
+  }
+
   const token = config.extraHeaders?.['Catpaw-Auth'];
   if (!config.autoRefreshToken || !token) {
     return null;
@@ -266,7 +279,7 @@ function createCredentialManager(config) {
   });
 }
 
-function buildUpstreamHeaders(config, credentialManager, credential) {
+function buildUpstreamHeaders(config, credential) {
   const headers = {
     'Content-Type': 'application/json',
     Accept: config.forceStream ? 'text/event-stream' : 'application/json',
@@ -287,18 +300,17 @@ function buildUpstreamHeaders(config, credentialManager, credential) {
     headers['Catpaw-Cookie'] = config.cookie;
   }
 
-  const current = credential || credentialManager?.snapshot();
-  if (current?.token) {
-    headers['Catpaw-Auth'] = current.token;
+  if (credential?.token) {
+    headers['Catpaw-Auth'] = credential.token;
   }
-  if (current?.cookie) {
-    headers.Cookie = current.cookie;
-    headers['Catpaw-Cookie'] = current.cookie;
+  if (credential?.cookie) {
+    headers.Cookie = credential.cookie;
+    headers['Catpaw-Cookie'] = credential.cookie;
   }
-  if (current?.userMis) {
-    headers['user-mis-id'] = current.userMis;
-    headers['user-uid'] = current.userMis;
-    headers['mis-id'] = current.userMis;
+  if (credential?.userMis) {
+    headers['user-mis-id'] = credential.userMis;
+    headers['user-uid'] = credential.userMis;
+    headers['mis-id'] = credential.userMis;
   }
 
   return headers;
@@ -307,12 +319,12 @@ function buildUpstreamHeaders(config, credentialManager, credential) {
 async function fetchWithCredentialRefresh(
   config,
   upstreamRequest,
-  credentialManager,
+  credentialProvider,
   signal,
 ) {
   const sendAttempt = async () => {
-    const credential = credentialManager?.snapshot();
-    const headers = buildUpstreamHeaders(config, credentialManager, credential);
+    const credential = await getCredentialSnapshot(credentialProvider);
+    const headers = buildUpstreamHeaders(config, credential);
     const body = buildUpstreamBody(upstreamRequest, headers, config);
     const response = await fetch(config.upstreamUrl, {
       method: 'POST',
@@ -324,11 +336,11 @@ async function fetchWithCredentialRefresh(
   };
 
   const first = await sendAttempt();
-  if (first.response.status !== 401 || !credentialManager) {
+  if (first.response.status !== 401 || !credentialProvider) {
     return first.response;
   }
 
-  const changed = await credentialManager.refreshAfterUnauthorized(first.token);
+  const changed = await credentialProvider.refreshAfterUnauthorized(first.token);
   if (!changed) {
     return first.response;
   }
@@ -690,7 +702,7 @@ function createGatewayMetrics(
   limits,
   agentSessions,
   usageStore,
-  credentialManager,
+  credentialProvider,
 ) {
   const startedAt = Date.now();
   const quotaUrl = config.upstreamBaseUrl
@@ -759,9 +771,10 @@ function createGatewayMetrics(
       quotaRequest = (async () => {
         quotaLastFetchedAt = Date.now();
         try {
+          const credential = await getCredentialSnapshot(credentialProvider);
           const headers = buildUpstreamHeaders(
             { ...config, forceStream: false },
-            credentialManager,
+            credential,
           );
           headers.Accept = 'application/json';
           const response = await fetch(quotaUrl, {

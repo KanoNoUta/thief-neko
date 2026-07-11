@@ -1,6 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CatpawCredentialManager } from '../src/catpawCredentials.js';
+import {
+  CatpawCredentialManager,
+  getCredentialSnapshot,
+} from '../src/catpawCredentials.js';
+
+test('getCredentialSnapshot awaits exactly one provider snapshot', async () => {
+  let snapshots = 0;
+  const provider = {
+    async snapshot() {
+      snapshots += 1;
+      return { token: 'broker-token', cookie: '', userMis: 'broker-user', generation: 4 };
+    },
+  };
+
+  assert.deepEqual(await getCredentialSnapshot(provider), {
+    token: 'broker-token',
+    cookie: '',
+    userMis: 'broker-user',
+    generation: 4,
+  });
+  assert.equal(snapshots, 1);
+  assert.equal(await getCredentialSnapshot(null), null);
+});
 
 test('CatpawCredentialManager atomically replaces token, user headers, and credential cookies', async () => {
   const manager = new CatpawCredentialManager({

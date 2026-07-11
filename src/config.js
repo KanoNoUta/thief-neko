@@ -10,6 +10,7 @@ export function loadConfig(env = process.env) {
   const upstreamBaseUrl = normalizeBaseUrl(env.CATPAW_BASE_URL);
   const upstreamUrl = normalizeUpstreamUrl(env.CATPAW_UPSTREAM_URL, upstreamBaseUrl);
   const listenPort = parsePort(env.PORT);
+  const credentialBroker = parseCredentialBroker(env);
 
   return {
     upstreamBaseUrl,
@@ -33,10 +34,29 @@ export function loadConfig(env = process.env) {
       upstreamUrl.includes('/api/gpt/openai/stream'),
     ),
     autoRefreshToken: parseBoolean(env.CATPAW_AUTO_REFRESH_TOKEN, false),
+    credentialPipe: credentialBroker.pipe,
+    credentialNonce: credentialBroker.nonce,
     userModelTypeCode: parseModelType(env.CATPAW_MODEL_TYPE),
     claudeSessionRoot: resolveClaudeSessionRoot(env),
     usageStorePath: resolveUsageStorePath(env),
   };
+}
+
+function parseCredentialBroker(env) {
+  const hasPipe = env.CATPAW_CREDENTIAL_PIPE !== undefined;
+  const hasNonce = env.CATPAW_CREDENTIAL_NONCE !== undefined;
+  if (!hasPipe && !hasNonce) {
+    return { pipe: '', nonce: '' };
+  }
+
+  const pipe = String(env.CATPAW_CREDENTIAL_PIPE || '').trim();
+  const nonce = String(env.CATPAW_CREDENTIAL_NONCE || '');
+  if (!pipe || !nonce.trim()) {
+    throw new Error(
+      'CATPAW_CREDENTIAL_PIPE and CATPAW_CREDENTIAL_NONCE must be provided together and non-blank',
+    );
+  }
+  return { pipe, nonce };
 }
 
 function resolveUsageStorePath(env) {
