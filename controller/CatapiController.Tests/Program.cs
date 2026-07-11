@@ -16,6 +16,7 @@ var tests = new List<(string Name, Func<Task> Run)>
     ("automatic mode rejects missing current and fallback Tokens", AutomaticModeRejectsMissingTokenAsync),
 };
 tests.AddRange(AuthSessionStoreTests.All());
+tests.AddRange(CatpawAuthClientTests.All());
 
 foreach (var test in tests)
 {
