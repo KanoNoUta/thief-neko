@@ -10,6 +10,7 @@ internal sealed class AuthSessionStore
     private sealed record LegacyStoredSettings(string ProtectedToken, string Tenant);
 
     private readonly string? _legacySettingsPath;
+    private readonly string _migrationMarkerPath;
 
     public string FilePath { get; }
 
@@ -21,6 +22,7 @@ internal sealed class AuthSessionStore
         FilePath = filePath ?? Path.Combine(directory, "auth-session.json");
         _legacySettingsPath = legacySettingsPath
             ?? (filePath is null ? Path.Combine(directory, "settings.json") : null);
+        _migrationMarkerPath = FilePath + ".migration-complete";
     }
 
     public async Task<AuthSession?> LoadAsync(CancellationToken cancellationToken = default)
@@ -30,7 +32,9 @@ internal sealed class AuthSessionStore
             return await LoadProtectedSessionAsync(cancellationToken);
         }
 
-        return await MigrateLegacySessionAsync(cancellationToken);
+        return File.Exists(_migrationMarkerPath)
+            ? null
+            : await MigrateLegacySessionAsync(cancellationToken);
     }
 
     public async Task SaveAsync(AuthSession session, CancellationToken cancellationToken = default)
@@ -57,26 +61,44 @@ internal sealed class AuthSessionStore
         }
     }
 
-    public Task ClearAsync(CancellationToken cancellationToken = default)
+    public async Task ClearAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+        await File.WriteAllTextAsync(
+            _migrationMarkerPath,
+            string.Empty,
+            Encoding.UTF8,
+            cancellationToken);
         File.Delete(FilePath);
-        return Task.CompletedTask;
+        File.Delete(FilePath + ".tmp");
     }
 
     private async Task<AuthSession?> LoadProtectedSessionAsync(CancellationToken cancellationToken)
     {
-        var encoded = await File.ReadAllTextAsync(FilePath, cancellationToken);
-        var protectedPayload = Convert.FromBase64String(encoded);
+        byte[]? protectedPayload = null;
         byte[]? payload = null;
         try
         {
+            var encoded = await File.ReadAllTextAsync(FilePath, cancellationToken);
+            protectedPayload = Convert.FromBase64String(encoded);
             payload = ProtectedData.Unprotect(protectedPayload, null, DataProtectionScope.CurrentUser);
             return JsonSerializer.Deserialize<AuthSession>(payload);
         }
+        catch (Exception error) when (error is FormatException
+            or CryptographicException
+            or JsonException
+            or InvalidDataException)
+        {
+            return null;
+        }
         finally
         {
-            CryptographicOperations.ZeroMemory(protectedPayload);
+            if (protectedPayload is not null)
+            {
+                CryptographicOperations.ZeroMemory(protectedPayload);
+            }
+
             if (payload is not null)
             {
                 CryptographicOperations.ZeroMemory(payload);
@@ -113,6 +135,11 @@ internal sealed class AuthSessionStore
                 null,
                 DateTimeOffset.UtcNow);
             await SaveAsync(session, cancellationToken);
+            await File.WriteAllTextAsync(
+                _migrationMarkerPath,
+                string.Empty,
+                Encoding.UTF8,
+                cancellationToken);
             return session;
         }
         finally
