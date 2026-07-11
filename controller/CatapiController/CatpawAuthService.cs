@@ -25,6 +25,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     private readonly Func<CancellationToken, Task<AuthSession?>> _loadSession;
     private readonly Func<AuthSession, CancellationToken, Task> _saveSession;
     private readonly Func<CancellationToken, Task> _beforeFailureStatusMutation;
+    private readonly string _installationIdPath;
     private readonly SemaphoreSlim _mutationGate = new(1, 1);
     private readonly object _sync = new();
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -51,7 +52,8 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         TimeProvider? timeProvider = null,
         Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
         Func<AuthSession, CancellationToken, Task>? saveSession = null,
-        Func<CancellationToken, Task>? beforeFailureStatusMutation = null)
+        Func<CancellationToken, Task>? beforeFailureStatusMutation = null,
+        string? installationIdPath = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         ArgumentNullException.ThrowIfNull(store);
@@ -63,6 +65,10 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         _saveSession = saveSession ?? store.SaveAsync;
         _beforeFailureStatusMutation = beforeFailureStatusMutation
             ?? (_ => Task.CompletedTask);
+        _installationIdPath = installationIdPath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Catapi",
+            "installation.id");
     }
 
     public async Task<AuthSession?> GetSessionAsync(CancellationToken ct = default)
@@ -191,6 +197,47 @@ internal sealed class CatpawAuthService : IAsyncDisposable
                 _status = new AuthStatus(true, session.AccountLabel, "SignedIn");
                 SignalSessionChangedLocked();
             }
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
+    }
+
+    public async Task<string> GetInstallationIdAsync(CancellationToken ct = default)
+    {
+        await _mutationGate.WaitAsync(ct);
+        try
+        {
+            ThrowIfDisposed();
+            if (File.Exists(_installationIdPath))
+            {
+                var existing = (await File.ReadAllTextAsync(_installationIdPath, ct)).Trim();
+                if (Guid.TryParseExact(existing, "D", out var parsed))
+                {
+                    return parsed.ToString("D");
+                }
+            }
+
+            var installationId = Guid.NewGuid().ToString("D");
+            var directory = Path.GetDirectoryName(_installationIdPath)
+                ?? throw new InvalidOperationException("Installation ID path is invalid.");
+            Directory.CreateDirectory(directory);
+            var temporaryPath = $"{_installationIdPath}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                await File.WriteAllTextAsync(temporaryPath, installationId, ct);
+                File.Move(temporaryPath, _installationIdPath, true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+
+            return installationId;
         }
         finally
         {

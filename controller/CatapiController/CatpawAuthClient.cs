@@ -24,6 +24,25 @@ internal interface ICatpawAuthClient
     Task<AccountInfo> GetUserInfoAsync(string accessToken, CancellationToken ct);
 }
 
+internal interface ICatpawLoginClient
+{
+    Task<QrLoginChallenge> CreateQrAsync(CancellationToken ct);
+    Task<QrLoginPoll> PollQrAsync(string code, CancellationToken ct);
+    Task<SmsChallenge> SendSmsAsync(string mobile, string deviceId, CancellationToken ct);
+    Task<MobileVerification> VerifySmsAsync(string mobile, string code, CancellationToken ct);
+    Task<AuthSession> LoginMobileAsync(
+        string mobile,
+        string code,
+        string? invitation,
+        CancellationToken ct);
+    Task<AuthSession> BindMobileAsync(
+        string qrCode,
+        string mobile,
+        string code,
+        string? invitation,
+        CancellationToken ct);
+}
+
 internal enum CatpawAuthFailureKind
 {
     Protocol,
@@ -43,7 +62,7 @@ internal sealed class CatpawAuthException : Exception
     public CatpawAuthFailureKind Kind { get; }
 }
 
-internal sealed class CatpawAuthClient : ICatpawAuthClient
+internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
 {
     private static readonly Uri ServiceRoot = new("https://catpaw.meituan.com");
     internal static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromSeconds(15);
