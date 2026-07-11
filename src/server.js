@@ -49,7 +49,7 @@ export function createGatewayServer(config, dependencies = {}) {
   const credentialProvider = dependencies.credentialProvider
     || dependencies.credentialManager
     || createCredentialProvider(config);
-  credentialProvider?.start();
+  credentialProvider?.start?.();
   const metrics = createGatewayMetrics(
     config,
     limits,
@@ -82,7 +82,7 @@ export function createGatewayServer(config, dependencies = {}) {
   server.requestTimeout = limits.upstreamTimeoutMs + 30_000;
   server.headersTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
-  server.on('close', () => credentialProvider?.stop());
+  server.on('close', () => credentialProvider?.stop?.());
   return server;
 }
 
@@ -266,14 +266,14 @@ export function createCredentialProvider(config) {
     });
   }
 
-  const token = config.extraHeaders?.['Catpaw-Auth'];
+  const token = getHeaderCaseInsensitive(config.extraHeaders, 'Catpaw-Auth');
   if (!config.autoRefreshToken || !token) {
     return null;
   }
   return new CatpawCredentialManager({
     token,
     cookie: config.cookie,
-    userMis: config.extraHeaders?.['user-mis-id'],
+    userMis: getHeaderCaseInsensitive(config.extraHeaders, 'user-mis-id'),
     readSession: () => readCatpawSessionAsync(),
     onRefresh: () => console.log('Catpaw credentials refreshed automatically'),
   });
@@ -320,6 +320,22 @@ function buildUpstreamHeaders(config, credential) {
   return headers;
 }
 
+function getHeaderCaseInsensitive(headers, targetName) {
+  if (!headers) {
+    return undefined;
+  }
+  if (Object.hasOwn(headers, targetName)) {
+    return headers[targetName];
+  }
+  const normalizedTarget = targetName.toLowerCase();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() === normalizedTarget) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 const CREDENTIAL_HEADER_NAMES = new Set([
   'authorization',
   'catpaw-auth',
@@ -362,7 +378,12 @@ async function fetchWithCredentialRefresh(
     return first.response;
   }
 
-  const changed = await credentialProvider.refreshAfterUnauthorized(first.token);
+  let changed;
+  try {
+    changed = await credentialProvider.refreshAfterUnauthorized(first.token);
+  } catch {
+    return first.response;
+  }
   if (!changed) {
     return first.response;
   }
@@ -782,11 +803,11 @@ function createGatewayMetrics(
       }
     },
     async refreshQuota() {
-      if (!quotaUrl || Date.now() - quotaLastFetchedAt < 30_000) {
-        return;
-      }
       if (quotaRequest) {
         await quotaRequest;
+        return;
+      }
+      if (!quotaUrl || Date.now() - quotaLastFetchedAt < 30_000) {
         return;
       }
 

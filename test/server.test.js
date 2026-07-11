@@ -188,6 +188,25 @@ test('credential provider selection prefers broker, then SQLite, then manual hea
   assert.equal(manual, null);
 });
 
+test('legacy provider selection reads token and user headers case-insensitively', () => {
+  const provider = createCredentialProvider({
+    autoRefreshToken: true,
+    extraHeaders: {
+      'cAtPaW-aUtH': 'mixed-case-token',
+      'USER-MIS-ID': 'mixed-case-user',
+    },
+    cookie: 'passport=mixed-case-token',
+  });
+
+  assert.ok(provider instanceof CatpawCredentialManager);
+  assert.deepEqual(provider.snapshot(), {
+    token: 'mixed-case-token',
+    cookie: 'passport=mixed-case-token',
+    userMis: 'mixed-case-user',
+    generation: 0,
+  });
+});
+
 test('gateway awaits a broker snapshot before the first upstream attempt', async (t) => {
   let upstreamToken;
   const upstream = http.createServer(async (req, res) => {
@@ -552,6 +571,24 @@ test('gateway maps an unresolved Catpaw 401 to a temporary 503 without replaying
   assert.equal(attempts, 1);
 });
 
+test('gateway maps a thrown provider refresh error to a sanitized temporary 503', async (t) => {
+  await assertRefreshFailureMapsToTemporary503(t, {
+    refreshAfterUnauthorized: () => {
+      throw new Error('throwing-provider-secret');
+    },
+    secret: 'throwing-provider-secret',
+  });
+});
+
+test('gateway maps a provider refresh timeout to a sanitized temporary 503', async (t) => {
+  const timeout = new Error('timeout-provider-secret');
+  timeout.code = 'CREDENTIAL_BROKER_TIMEOUT';
+  await assertRefreshFailureMapsToTemporary503(t, {
+    refreshAfterUnauthorized: () => Promise.reject(timeout),
+    secret: 'timeout-provider-secret',
+  });
+});
+
 test('gateway starts and stops the selected credential provider', async () => {
   let starts = 0;
   let stops = 0;
@@ -569,6 +606,28 @@ test('gateway starts and stops the selected credential provider', async () => {
   await listen(gateway);
   await new Promise((resolve) => gateway.close(resolve));
   assert.equal(stops, 1);
+});
+
+test('gateway accepts a credential provider without lifecycle hooks', async (t) => {
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"optional-hooks","content":"OPTIONAL_HOOKS_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const credentialProvider = {
+    snapshot: async () => credential('hookless-token', 'hookless-user', 1),
+    refreshAfterUnauthorized: async () => false,
+  };
+  const gateway = createTestGateway(upstream, credentialProvider);
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('optional hooks'));
+
+  assert.match(response, /OPTIONAL_HOOKS_OK/);
 });
 
 test('gateway injects Claude Desktop workspace mounts and rewrites native file tool paths', async (t) => {
@@ -720,6 +779,69 @@ test('gateway status reads Catpaw quota from the user limit endpoint', async (t)
   assert.deepEqual(status.quota, { remaining: 383, used: 117, total: 500 });
   assert.equal(quotaToken, 'broker-quota-token');
   assert.equal(snapshots, 1);
+});
+
+test('concurrent status callers await one in-flight quota refresh', async (t) => {
+  let quotaRequests = 0;
+  const upstream = http.createServer((req, res) => {
+    quotaRequests += 1;
+    sendJson(res, {
+      code: 0,
+      data: {
+        modelRequestCount: 20,
+        modelRequestLimit: 100,
+        modelRemaingCount: 80,
+      },
+    });
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  let releaseSnapshot;
+  let markSnapshotStarted;
+  let snapshots = 0;
+  const snapshotStarted = new Promise((resolve) => { markSnapshotStarted = resolve; });
+  const heldSnapshot = new Promise((resolve) => { releaseSnapshot = resolve; });
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => {
+      snapshots += 1;
+      markSnapshotStarted();
+      return heldSnapshot;
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamBaseUrl: baseUrl,
+    upstreamUrl: `${baseUrl}/unused`,
+    model: 'glm-5.2',
+  }, { credentialProvider });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const statusUrl = `http://127.0.0.1:${gateway.address().port}/admin/status`;
+  const first = fetch(statusUrl);
+  await snapshotStarted;
+  let secondSettled = false;
+  const second = fetch(statusUrl).then((response) => {
+    secondSettled = true;
+    return response;
+  });
+  await delay(30);
+  const settledBeforeRelease = secondSettled;
+  releaseSnapshot(credential('quota-token', 'quota-user', 1));
+
+  const responses = await Promise.all([first, second]);
+  const statuses = await Promise.all(responses.map((response) => response.json()));
+
+  assert.equal(settledBeforeRelease, false);
+  assert.equal(responses.every((response) => response.status === 200), true);
+  assert.deepEqual(statuses.map(({ quota }) => quota), [
+    { remaining: 80, used: 20, total: 100 },
+    { remaining: 80, used: 20, total: 100 },
+  ]);
+  assert.equal(snapshots, 1);
+  assert.equal(quotaRequests, 1);
 });
 
 test('gateway status returns persisted usage for an inclusive date range', async (t) => {
@@ -909,6 +1031,46 @@ function testMessage(content) {
     stream: true,
     messages: [{ role: 'user', content }],
   };
+}
+
+async function assertRefreshFailureMapsToTemporary503(t, {
+  refreshAfterUnauthorized,
+  secret,
+}) {
+  let attempts = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    attempts += 1;
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end('{"message":"upstream-auth-body"}');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => credential('rejected-token', 'refresh-user', 1),
+    refreshAfterUnauthorized,
+  });
+  const gateway = createTestGateway(upstream, credentialProvider);
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await fetch(messageUrl(gateway), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(testMessage('refresh failure')),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error.type, 'upstream_auth_refresh_pending');
+  assert.match(body.error.message, /upstream-auth-body/);
+  assert.equal(JSON.stringify(body).includes(secret), false);
+  assert.equal(attempts, 1);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function postJson(url, body) {
