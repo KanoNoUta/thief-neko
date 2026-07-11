@@ -31,6 +31,8 @@ internal static class CatpawAuthServiceTests
             ScheduledFailureUsesRetryFloorAsync);
         yield return ("Catpaw auth service escalates concurrent no-op to forced refresh",
             ForcedRefreshEscalatesConcurrentNoOpAsync);
+        yield return ("Catpaw auth service forced caller joins concurrent real refresh",
+            ForcedRefreshJoinsConcurrentRealRefreshAsync);
         yield return ("Catpaw auth service persists refresh before publication",
             RefreshPersistsBeforePublicationAsync);
         yield return ("Catpaw auth service status and errors redact credentials",
@@ -390,6 +392,47 @@ internal static class CatpawAuthServiceTests
             "forced caller should receive a genuinely refreshed session");
         AssertEqual(1, client.RefreshCalls,
             "forced caller should invoke client after concurrent no-op completes");
+    }
+
+    private static async Task ForcedRefreshJoinsConcurrentRealRefreshAsync()
+    {
+        using var directory = new AuthTemporaryDirectory();
+        var refreshEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefresh = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var current = Session("due-access", "due-refresh") with
+        {
+            AccessExpiresAt = DateTimeOffset.Parse("2026-07-11T09:00:00Z"),
+        };
+        var rotated = Session("joined-access", "joined-refresh");
+        var client = new FakeAuthClient
+        {
+            Refresh = async (_, ct) =>
+            {
+                refreshEntered.TrySetResult();
+                await releaseRefresh.Task.WaitAsync(ct);
+                return rotated;
+            },
+        };
+        await using var service = Service(
+            client,
+            new AuthSessionStore(Path.Combine(directory.Path, "session.json")),
+            timeProvider: new FixedTimeProvider(DateTimeOffset.Parse("2026-07-11T10:00:00Z")));
+        await service.SaveLoginAsync(current, default);
+
+        var nonForced = service.RefreshAsync(false, default);
+        await refreshEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var forced = service.RefreshAsync(true, default);
+        releaseRefresh.SetResult();
+
+        var results = await Task.WhenAll(nonForced, forced);
+        AssertEqual(rotated, results[0],
+            "non-forced caller should receive rotated session");
+        AssertEqual(rotated, results[1],
+            "forced caller should share the rotated session");
+        AssertEqual(1, client.RefreshCalls,
+            "forced caller should not repeat an in-flight network refresh");
     }
 
     private static async Task RefreshPersistsBeforePublicationAsync()

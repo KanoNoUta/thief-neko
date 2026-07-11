@@ -8,6 +8,10 @@ namespace CatapiController;
 
 internal sealed class CatpawAuthService : IAsyncDisposable
 {
+    private sealed record RefreshOutcome(
+        AuthSession Session,
+        bool PerformedNetworkRefresh);
+
     private static readonly TimeSpan[] RetryDelays =
     {
         TimeSpan.FromSeconds(1),
@@ -31,8 +35,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     private AuthSession? _session;
     private bool _loaded;
     private AuthStatus _status = new(false, string.Empty, "LoginRequired");
-    private Task<AuthSession>? _refreshTask;
-    private bool _refreshTaskForced;
+    private Task<RefreshOutcome>? _refreshTask;
     private CancellationTokenSource? _schedulerCancellation;
     private Task? _schedulerTask;
     private bool _disposed;
@@ -115,27 +118,26 @@ internal sealed class CatpawAuthService : IAsyncDisposable
 
     public Task<AuthSession> RefreshAsync(bool force, CancellationToken ct)
     {
-        Task<AuthSession> refresh;
-        var escalateAfterCurrent = false;
+        Task<RefreshOutcome> refresh;
+        var joinedActiveRefresh = false;
         lock (_sync)
         {
             ThrowIfDisposed();
             if (_refreshTask is null || _refreshTask.IsCompleted)
             {
                 _refreshTask = RefreshCoreAsync(force, _lifetimeCancellation.Token);
-                _refreshTaskForced = force;
             }
-            else if (force && !_refreshTaskForced)
+            else
             {
-                escalateAfterCurrent = true;
+                joinedActiveRefresh = true;
             }
 
             refresh = _refreshTask;
         }
 
-        return escalateAfterCurrent
-            ? RefreshAfterAsync(refresh, ct)
-            : refresh.WaitAsync(ct);
+        return force && joinedActiveRefresh
+            ? JoinForForcedRefreshAsync(refresh, ct)
+            : GetSessionFromOutcomeAsync(refresh, ct);
     }
 
     public async Task SaveLoginAsync(AuthSession session, CancellationToken ct)
@@ -225,13 +227,13 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         _lifetimeCancellation.Dispose();
     }
 
-    private async Task<AuthSession> RefreshCoreAsync(bool force, CancellationToken ct)
+    private async Task<RefreshOutcome> RefreshCoreAsync(bool force, CancellationToken ct)
     {
         var current = await GetSessionAsync(ct)
             ?? throw new InvalidOperationException("Catpaw login is required.");
         if (!force && GetRefreshDelay(current) > TimeSpan.Zero)
         {
-            return current;
+            return new RefreshOutcome(current, false);
         }
 
         for (var attempt = 0; ; attempt++)
@@ -247,7 +249,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
                     _status = new AuthStatus(true, refreshed.AccountLabel, "SignedIn");
                 }
 
-                return refreshed;
+                return new RefreshOutcome(refreshed, true);
             }
             catch (CatpawAuthException error)
                 when (error.Kind == CatpawAuthFailureKind.AuthRejected)
@@ -284,12 +286,22 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         }
     }
 
-    private async Task<AuthSession> RefreshAfterAsync(
-        Task<AuthSession> current,
+    private static async Task<AuthSession> GetSessionFromOutcomeAsync(
+        Task<RefreshOutcome> refresh,
         CancellationToken ct)
     {
-        await current.WaitAsync(ct);
-        return await RefreshAsync(true, ct);
+        var outcome = await refresh.WaitAsync(ct);
+        return outcome.Session;
+    }
+
+    private async Task<AuthSession> JoinForForcedRefreshAsync(
+        Task<RefreshOutcome> refresh,
+        CancellationToken ct)
+    {
+        var outcome = await refresh.WaitAsync(ct);
+        return outcome.PerformedNetworkRefresh
+            ? outcome.Session
+            : await RefreshAsync(true, ct);
     }
 
     private async Task RunSchedulerAsync(CancellationToken ct)
