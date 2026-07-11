@@ -286,6 +286,10 @@ function buildUpstreamHeaders(config, credential) {
     ...config.extraHeaders,
   };
 
+  if (credential) {
+    removeCredentialHeaders(headers);
+  }
+
   if (config.forceStream) {
     headers['Cache-Control'] = 'no-cache';
     headers.Connection = 'keep-alive';
@@ -295,7 +299,7 @@ function buildUpstreamHeaders(config, credential) {
     headers.authorization = `Bearer ${config.apiKey}`;
   }
 
-  if (config.cookie) {
+  if (!credential && config.cookie) {
     headers.Cookie = config.cookie;
     headers['Catpaw-Cookie'] = config.cookie;
   }
@@ -314,6 +318,24 @@ function buildUpstreamHeaders(config, credential) {
   }
 
   return headers;
+}
+
+const CREDENTIAL_HEADER_NAMES = new Set([
+  'authorization',
+  'catpaw-auth',
+  'cookie',
+  'catpaw-cookie',
+  'user-mis-id',
+  'user-uid',
+  'mis-id',
+]);
+
+function removeCredentialHeaders(headers) {
+  for (const name of Object.keys(headers)) {
+    if (CREDENTIAL_HEADER_NAMES.has(name.toLowerCase())) {
+      delete headers[name];
+    }
+  }
 }
 
 async function fetchWithCredentialRefresh(

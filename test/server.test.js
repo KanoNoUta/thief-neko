@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { createGatewayServer, createCredentialProvider } from '../src/server.js';
 import { CatpawCredentialManager } from '../src/catpawCredentials.js';
 import { CredentialBroker } from '../src/credentialBroker.js';
+import { loadConfig } from '../src/config.js';
 import { UsageStore } from '../src/usageStore.js';
 
 test('gateway uses Catpaw native Agent protocol for a complete Claude tool loop', async (t) => {
@@ -214,6 +215,134 @@ test('gateway awaits a broker snapshot before the first upstream attempt', async
   assert.match(response, /BROKER_FIRST_OK/);
   assert.equal(upstreamToken, 'broker-token');
   assert.equal(snapshots, 1);
+});
+
+test('broker snapshot atomically replaces mixed-case static credential headers', async (t) => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    received = {
+      headers: req.headers,
+      counts: countRawHeaders(req.rawHeaders),
+    };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"atomic","content":"ATOMIC_HEADERS_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const config = loadConfig({
+    CATPAW_BASE_URL: baseUrl,
+    CATPAW_UPSTREAM_URL: `${baseUrl}/api/gpt/openai/stream`,
+    CATPAW_API_KEY: 'current-api-key',
+    CATPAW_HEADERS: JSON.stringify({
+      'catpaw-auth': 'stale-token',
+      COOKIE: 'stale-cookie',
+      'cAtPaW-cOoKiE': 'stale-catpaw-cookie',
+      'USER-MIS-ID': 'stale-user-mis',
+      'User-Uid': 'stale-user-uid',
+      'MIS-ID': 'stale-mis-id',
+      aUtHoRiZaTiOn: 'Bearer stale-api-key',
+    }),
+  });
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => credential('current-token', 'current-user', 5),
+  });
+  const gateway = createGatewayServer(config, { credentialProvider });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('atomic headers'));
+
+  assert.match(response, /ATOMIC_HEADERS_OK/);
+  assert.deepEqual(pickCredentialHeaders(received.headers), {
+    authorization: 'Bearer current-api-key',
+    'catpaw-auth': 'current-token',
+    cookie: 'passport=current-token',
+    'catpaw-cookie': 'passport=current-token',
+    'user-mis-id': 'current-user',
+    'user-uid': 'current-user',
+    'mis-id': 'current-user',
+  });
+  for (const name of CREDENTIAL_HEADER_NAMES) {
+    assert.equal(received.counts[name], 1, name);
+  }
+});
+
+test('manual mode preserves mixed-case static credential headers', async (t) => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    received = req.headers;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"manual","content":"MANUAL_HEADERS_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const config = loadConfig({
+    CATPAW_BASE_URL: baseUrl,
+    CATPAW_UPSTREAM_URL: `${baseUrl}/api/gpt/openai/stream`,
+    CATPAW_HEADERS: JSON.stringify({
+      'cAtPaW-aUtH': 'manual-token',
+      COOKIE: 'manual-cookie',
+      'CATPAW-COOKIE': 'manual-catpaw-cookie',
+      'USER-MIS-ID': 'manual-user',
+      'User-Uid': 'manual-uid',
+      'MIS-ID': 'manual-mis',
+      AUTHORIZATION: 'Bearer manual-api-key',
+    }),
+  });
+  const gateway = createGatewayServer(config);
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('manual headers'));
+
+  assert.match(response, /MANUAL_HEADERS_OK/);
+  assert.deepEqual(pickCredentialHeaders(received), {
+    authorization: 'Bearer manual-api-key',
+    'catpaw-auth': 'manual-token',
+    cookie: 'manual-cookie',
+    'catpaw-cookie': 'manual-catpaw-cookie',
+    'user-mis-id': 'manual-user',
+    'user-uid': 'manual-uid',
+    'mis-id': 'manual-mis',
+  });
+});
+
+test('provider snapshot with no cookie suppresses the static cookie fallback', async (t) => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    received = req.headers;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"id":"cookieless","content":"COOKIELESS_OK","choices":[{"finishReason":"stop"}],"lastOne":true,"statusCode":0}\n\n');
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const credentialProvider = createAsyncCredentialProvider({
+    snapshot: async () => ({
+      token: 'current-token',
+      cookie: '',
+      userMis: 'current-user',
+      generation: 6,
+    }),
+  });
+  const gateway = createTestGateway(upstream, credentialProvider, {
+    cookie: 'stale-static-cookie',
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await postJson(messageUrl(gateway), testMessage('no cookie'));
+
+  assert.match(response, /COOKIELESS_OK/);
+  assert.equal(received.cookie, undefined);
+  assert.equal(received['catpaw-cookie'], undefined);
 });
 
 test('gateway rebuilds encrypted headers and body for one broker replay', async (t) => {
@@ -727,6 +856,31 @@ function credential(token, userMis, generation) {
     cookie: `passport=${token}`,
     generation,
   };
+}
+
+const CREDENTIAL_HEADER_NAMES = [
+  'authorization',
+  'catpaw-auth',
+  'cookie',
+  'catpaw-cookie',
+  'user-mis-id',
+  'user-uid',
+  'mis-id',
+];
+
+function pickCredentialHeaders(headers) {
+  return Object.fromEntries(
+    CREDENTIAL_HEADER_NAMES.map((name) => [name, headers[name]]),
+  );
+}
+
+function countRawHeaders(rawHeaders) {
+  const counts = {};
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index].toLowerCase();
+    counts[name] = (counts[name] || 0) + 1;
+  }
+  return counts;
 }
 
 function createTestGateway(upstream, credentialProvider, overrides = {}) {
