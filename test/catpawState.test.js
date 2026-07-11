@@ -1,6 +1,52 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readCatpawSessionAsync } from '../src/catpawState.js';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { readCatpawSession, readCatpawSessionAsync } from '../src/catpawState.js';
+
+test('readCatpawSession extracts credentials and account from a temporary SQLite state', async () => {
+  const appData = await mkdtemp(path.join(os.tmpdir(), 'catpaw-state-test-'));
+  const storageDirectory = path.join(
+    appData,
+    'CatPawAI',
+    'User',
+    'globalStorage',
+  );
+  await mkdir(storageDirectory, { recursive: true });
+  const database = new DatabaseSync(path.join(storageDirectory, 'state.vscdb'));
+
+  try {
+    database.exec('create table ItemTable (key text primary key, value text)');
+    const authentication = JSON.stringify({
+      refreshToken: 'fixture-refresh',
+      sessions: [{
+        accessToken: 'fixture-access',
+        account: { id: 'fixture-user', label: 'Fixture Account' },
+      }],
+    });
+    database.prepare('insert into ItemTable (key, value) values (?, ?)').run(
+      'catpaw.mt-authentication',
+      JSON.stringify({ 'mt.auth': authentication }),
+    );
+    database.close();
+
+    assert.deepEqual(readCatpawSession({ APPDATA: appData }), {
+      token: 'fixture-access',
+      refreshToken: 'fixture-refresh',
+      userMis: 'fixture-user',
+      accountLabel: 'Fixture Account',
+    });
+  } finally {
+    try {
+      database.close();
+    } catch {
+      // Already closed before the reader opens the database.
+    }
+    await rm(appData, { recursive: true, force: true });
+  }
+});
 
 test('readCatpawSessionAsync reads state through an asynchronous helper process', async () => {
   const env = { APPDATA: 'C:\\Users\\test\\AppData\\Roaming' };

@@ -1,8 +1,5 @@
-using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
-using System.Text;
-using System.Text.Json;
 
 namespace CatapiController;
 
@@ -18,33 +15,37 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         TimeSpan.FromSeconds(2),
         TimeSpan.FromSeconds(5),
     };
-    private static readonly TimeSpan ImportTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan SchedulerFailureDelay = TimeSpan.FromMinutes(5);
-    private const int MaxImportOutputCharacters = 64 * 1024;
 
     private readonly ICatpawAuthClient _client;
     private readonly string _tenant;
-    private readonly Func<string, CancellationToken, Task<string>> _desktopStateReader;
+    private readonly IDesktopStateReader _desktopStateReader;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _timeProvider;
     private readonly Func<CancellationToken, Task<AuthSession?>> _loadSession;
     private readonly Func<AuthSession, CancellationToken, Task> _saveSession;
+    private readonly SemaphoreSlim _mutationGate = new(1, 1);
     private readonly object _sync = new();
     private readonly CancellationTokenSource _lifetimeCancellation = new();
 
     private AuthSession? _session;
+    private long _sessionGeneration;
     private bool _loaded;
     private AuthStatus _status = new(false, string.Empty, "LoginRequired");
+    private TaskCompletionSource _sessionChanged = NewSignal();
     private Task<RefreshOutcome>? _refreshTask;
     private CancellationTokenSource? _schedulerCancellation;
     private Task? _schedulerTask;
+    private Task? _schedulerCleanupTask;
+    private long _schedulerGeneration;
     private bool _disposed;
+    private Task? _disposeTask;
 
     internal CatpawAuthService(
         ICatpawAuthClient client,
         AuthSessionStore store,
         string tenant,
-        Func<string, CancellationToken, Task<string>>? desktopStateReader = null,
+        IDesktopStateReader? desktopStateReader = null,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
         TimeProvider? timeProvider = null,
         Func<CancellationToken, Task<AuthSession?>>? loadSession = null,
@@ -53,7 +54,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         _client = client ?? throw new ArgumentNullException(nameof(client));
         ArgumentNullException.ThrowIfNull(store);
         _tenant = tenant ?? throw new ArgumentNullException(nameof(tenant));
-        _desktopStateReader = desktopStateReader ?? ReadDesktopStateAsync;
+        _desktopStateReader = desktopStateReader ?? new DesktopStateReader();
         _delay = delay ?? Task.Delay;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _loadSession = loadSession ?? store.LoadAsync;
@@ -71,19 +72,34 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             }
         }
 
-        var loaded = await _loadSession(ct);
-        lock (_sync)
+        await _mutationGate.WaitAsync(ct);
+        try
         {
-            if (!_loaded)
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                if (_loaded)
+                {
+                    return _session;
+                }
+            }
+
+            var loaded = await _loadSession(ct);
+            lock (_sync)
             {
                 _session = loaded;
                 _loaded = true;
+                _sessionGeneration++;
                 _status = loaded is null
                     ? new AuthStatus(false, string.Empty, "LoginRequired")
                     : new AuthStatus(true, loaded.AccountLabel, "SignedIn");
+                SignalSessionChangedLocked();
+                return _session;
             }
-
-            return _session;
+        }
+        finally
+        {
+            _mutationGate.Release();
         }
     }
 
@@ -94,8 +110,16 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(gatewayPath);
         try
         {
-            var json = await _desktopStateReader(gatewayPath, ct);
-            var imported = ParseDesktopSession(json);
+            var desktop = await _desktopStateReader.ReadAsync(gatewayPath, ct);
+            var imported = new AuthSession(
+                desktop.AccessToken,
+                desktop.RefreshToken,
+                desktop.UserId,
+                desktop.AccountLabel,
+                _tenant,
+                null,
+                null,
+                _timeProvider.GetUtcNow());
             var account = await _client.GetUserInfoAsync(imported.AccessToken, ct);
             if (!string.Equals(account.UserId, imported.UserId, StringComparison.Ordinal) ||
                 string.IsNullOrWhiteSpace(account.AccountLabel))
@@ -103,6 +127,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
                 throw new InvalidDataException();
             }
 
+            imported = imported with { AccountLabel = account.AccountLabel };
             await SaveLoginAsync(imported, ct);
             return imported;
         }
@@ -118,6 +143,7 @@ internal sealed class CatpawAuthService : IAsyncDisposable
 
     public Task<AuthSession> RefreshAsync(bool force, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Task<RefreshOutcome> refresh;
         var joinedActiveRefresh = false;
         lock (_sync)
@@ -143,13 +169,28 @@ internal sealed class CatpawAuthService : IAsyncDisposable
     public async Task SaveLoginAsync(AuthSession session, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(session);
-        await _saveSession(session, ct);
-        lock (_sync)
+        await _mutationGate.WaitAsync(ct);
+        try
         {
-            ThrowIfDisposed();
-            _session = session;
-            _loaded = true;
-            _status = new AuthStatus(true, session.AccountLabel, "SignedIn");
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+            }
+
+            await _saveSession(session, ct);
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                _session = session;
+                _loaded = true;
+                _sessionGeneration++;
+                _status = new AuthStatus(true, session.AccountLabel, "SignedIn");
+                SignalSessionChangedLocked();
+            }
+        }
+        finally
+        {
+            _mutationGate.Release();
         }
     }
 
@@ -167,23 +208,30 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         lock (_sync)
         {
             ThrowIfDisposed();
-            if (_schedulerTask is not null && !_schedulerTask.IsCompleted)
+            if (_schedulerTask is not null)
             {
                 return;
             }
 
-            _schedulerCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            var schedulerCancellation = CancellationTokenSource.CreateLinkedTokenSource(
                 _lifetimeCancellation.Token);
-            _schedulerTask = RunSchedulerAsync(_schedulerCancellation.Token);
+            var generation = ++_schedulerGeneration;
+            var scheduler = RunSchedulerAsync(schedulerCancellation.Token);
+            _schedulerCancellation = schedulerCancellation;
+            _schedulerTask = scheduler;
+            _schedulerCleanupTask = CleanupSchedulerAsync(
+                scheduler, schedulerCancellation, generation);
         }
     }
 
     public async Task StopAsync(CancellationToken ct = default)
     {
         Task? scheduler;
+        Task? cleanup;
         lock (_sync)
         {
             scheduler = _schedulerTask;
+            cleanup = _schedulerCleanupTask;
             _schedulerCancellation?.Cancel();
         }
 
@@ -199,38 +247,96 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
         }
-        finally
+
+        if (cleanup is not null)
         {
-            lock (_sync)
-            {
-                _schedulerCancellation?.Dispose();
-                _schedulerCancellation = null;
-                _schedulerTask = null;
-            }
+            await cleanup.WaitAsync(ct);
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private async Task CleanupSchedulerAsync(
+        Task scheduler,
+        CancellationTokenSource schedulerCancellation,
+        long generation)
+    {
+        await ObserveAsync(scheduler);
+        lock (_sync)
+        {
+            if (_schedulerGeneration == generation &&
+                ReferenceEquals(_schedulerCancellation, schedulerCancellation))
+            {
+                _schedulerCancellation = null;
+                _schedulerTask = null;
+                _schedulerCleanupTask = null;
+            }
+        }
+
+        schedulerCancellation.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
     {
         lock (_sync)
         {
-            if (_disposed)
+            if (_disposeTask is not null)
             {
-                return;
+                return new ValueTask(_disposeTask);
             }
 
             _disposed = true;
+            _disposeTask = DisposeCoreAsync(
+                _schedulerTask, _schedulerCleanupTask, _refreshTask);
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync(
+        Task? scheduler,
+        Task? schedulerCleanup,
+        Task? refresh)
+    {
+        _lifetimeCancellation.Cancel();
+        lock (_sync)
+        {
+            SignalSessionChangedLocked();
+            try
+            {
+                _schedulerCancellation?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
-        _lifetimeCancellation.Cancel();
-        await StopAsync();
+        await ObserveAsync(scheduler);
+        await ObserveAsync(schedulerCleanup);
+        await ObserveAsync(refresh);
+        await _mutationGate.WaitAsync();
+        _mutationGate.Release();
         _lifetimeCancellation.Dispose();
     }
 
     private async Task<RefreshOutcome> RefreshCoreAsync(bool force, CancellationToken ct)
     {
-        var current = await GetSessionAsync(ct)
-            ?? throw new InvalidOperationException("Catpaw login is required.");
+        await GetSessionAsync(ct);
+        AuthSession current;
+        long baseGeneration;
+        await _mutationGate.WaitAsync(ct);
+        try
+        {
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                current = _session
+                    ?? throw new InvalidOperationException("Catpaw login is required.");
+                baseGeneration = _sessionGeneration;
+            }
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
+
         if (!force && GetRefreshDelay(current) > TimeSpan.Zero)
         {
             return new RefreshOutcome(current, false);
@@ -238,15 +344,50 @@ internal sealed class CatpawAuthService : IAsyncDisposable
 
         for (var attempt = 0; ; attempt++)
         {
+            if (attempt > 0)
+            {
+                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
+                if (superseding.Changed)
+                {
+                    return new RefreshOutcome(
+                        superseding.Session ?? throw new InvalidOperationException(
+                            "Catpaw login is required."),
+                        true);
+                }
+            }
+
             try
             {
                 var refreshed = await _client.RefreshAsync(current, ct);
-                await _saveSession(refreshed, ct);
-                lock (_sync)
+                await _mutationGate.WaitAsync(ct);
+                try
                 {
-                    _session = refreshed;
-                    _loaded = true;
-                    _status = new AuthStatus(true, refreshed.AccountLabel, "SignedIn");
+                    lock (_sync)
+                    {
+                        ThrowIfDisposed();
+                        if (_sessionGeneration != baseGeneration)
+                        {
+                            return new RefreshOutcome(
+                                _session ?? throw new InvalidOperationException(
+                                    "Catpaw login is required."),
+                                true);
+                        }
+                    }
+
+                    await _saveSession(refreshed, ct);
+                    lock (_sync)
+                    {
+                        ThrowIfDisposed();
+                        _session = refreshed;
+                        _loaded = true;
+                        _sessionGeneration++;
+                        _status = new AuthStatus(true, refreshed.AccountLabel, "SignedIn");
+                        SignalSessionChangedLocked();
+                    }
+                }
+                finally
+                {
+                    _mutationGate.Release();
                 }
 
                 return new RefreshOutcome(refreshed, true);
@@ -254,15 +395,34 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             catch (CatpawAuthException error)
                 when (error.Kind == CatpawAuthFailureKind.AuthRejected)
             {
+                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
+                if (superseding.Changed)
+                {
+                    return new RefreshOutcome(
+                        superseding.Session ?? throw new InvalidOperationException(
+                            "Catpaw login is required."),
+                        true);
+                }
+
                 lock (_sync)
                 {
                     _status = new AuthStatus(false, current.AccountLabel, "LoginRequired");
+                    SignalSessionChangedLocked();
                 }
 
                 throw RedactedRefreshFailure(error.Kind);
             }
             catch (Exception error) when (IsTransient(error) && attempt < RetryDelays.Length)
             {
+                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
+                if (superseding.Changed)
+                {
+                    return new RefreshOutcome(
+                        superseding.Session ?? throw new InvalidOperationException(
+                            "Catpaw login is required."),
+                        true);
+                }
+
                 lock (_sync)
                 {
                     _status = new AuthStatus(true, current.AccountLabel, "RefreshPending");
@@ -272,6 +432,15 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             }
             catch (Exception error) when (IsTransient(error))
             {
+                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
+                if (superseding.Changed)
+                {
+                    return new RefreshOutcome(
+                        superseding.Session ?? throw new InvalidOperationException(
+                            "Catpaw login is required."),
+                        true);
+                }
+
                 lock (_sync)
                 {
                     _status = new AuthStatus(true, current.AccountLabel, "RefreshPending");
@@ -281,8 +450,36 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             }
             catch (CatpawAuthException error)
             {
+                var superseding = await GetSupersedingSessionAsync(baseGeneration, ct);
+                if (superseding.Changed)
+                {
+                    return new RefreshOutcome(
+                        superseding.Session ?? throw new InvalidOperationException(
+                            "Catpaw login is required."),
+                        true);
+                }
+
                 throw RedactedRefreshFailure(error.Kind);
             }
+        }
+    }
+
+    private async Task<(bool Changed, AuthSession? Session)> GetSupersedingSessionAsync(
+        long baseGeneration,
+        CancellationToken ct)
+    {
+        await _mutationGate.WaitAsync(ct);
+        try
+        {
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                return (_sessionGeneration != baseGeneration, _session);
+            }
+        }
+        finally
+        {
+            _mutationGate.Release();
         }
     }
 
@@ -309,13 +506,29 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var session = await GetSessionAsync(ct);
-            if (session is null)
+            await GetSessionAsync(ct);
+            AuthSession? session;
+            bool signedIn;
+            Task sessionChanged;
+            lock (_sync)
             {
-                return;
+                session = _session;
+                signedIn = _status.SignedIn;
+                sessionChanged = _sessionChanged.Task;
             }
 
-            await _delay(GetRefreshDelay(session), ct);
+            if (session is null || !signedIn)
+            {
+                await sessionChanged.WaitAsync(ct);
+                continue;
+            }
+
+            if (!await WaitForDelayOrSignalAsync(
+                    GetRefreshDelay(session), sessionChanged, ct))
+            {
+                continue;
+            }
+
             try
             {
                 await RefreshAsync(true, ct);
@@ -323,13 +536,39 @@ internal sealed class CatpawAuthService : IAsyncDisposable
             catch (CatpawAuthException error)
                 when (error.Kind == CatpawAuthFailureKind.AuthRejected)
             {
-                return;
+                continue;
             }
             catch (Exception error) when (IsTransient(error))
             {
-                await _delay(SchedulerFailureDelay, ct);
+                lock (_sync)
+                {
+                    sessionChanged = _sessionChanged.Task;
+                }
+
+                await WaitForDelayOrSignalAsync(
+                    SchedulerFailureDelay, sessionChanged, ct);
             }
         }
+    }
+
+    private async Task<bool> WaitForDelayOrSignalAsync(
+        TimeSpan duration,
+        Task sessionChanged,
+        CancellationToken ct)
+    {
+        using var delayCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var delay = _delay(duration, delayCancellation.Token);
+        var completed = await Task.WhenAny(delay, sessionChanged);
+        if (completed == sessionChanged)
+        {
+            delayCancellation.Cancel();
+            await ObserveAsync(delay);
+            ct.ThrowIfCancellationRequested();
+            return false;
+        }
+
+        await delay;
+        return true;
     }
 
     private TimeSpan GetRefreshDelay(AuthSession session)
@@ -344,39 +583,6 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
     }
 
-    private AuthSession ParseDesktopSession(string json)
-    {
-        using var document = JsonDocument.Parse(json);
-        var root = document.RootElement;
-        if (root.ValueKind != JsonValueKind.Object ||
-            root.EnumerateObject().Count() != 4)
-        {
-            throw new InvalidDataException();
-        }
-
-        return new AuthSession(
-            RequiredString(root, "token"),
-            RequiredString(root, "refreshToken"),
-            RequiredString(root, "userMis"),
-            RequiredString(root, "accountLabel"),
-            _tenant,
-            null,
-            null,
-            _timeProvider.GetUtcNow());
-    }
-
-    private static string RequiredString(JsonElement root, string name)
-    {
-        if (!root.TryGetProperty(name, out var value) ||
-            value.ValueKind != JsonValueKind.String ||
-            string.IsNullOrWhiteSpace(value.GetString()))
-        {
-            throw new InvalidDataException();
-        }
-
-        return value.GetString()!;
-    }
-
     private static bool IsTransient(Exception error) =>
         error is HttpRequestException ||
         error is CatpawAuthException
@@ -388,75 +594,14 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         CatpawAuthFailureKind kind) =>
         new("Catpaw session refresh failed.", kind);
 
-    private static async Task<string> ReadDesktopStateAsync(
-        string gatewayPath,
-        CancellationToken ct)
+    private static TaskCompletionSource NewSignal() => new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void SignalSessionChangedLocked()
     {
-        Process? process = null;
-        Task<string>? stdoutTask = null;
-        Task<string>? stderrTask = null;
-        try
-        {
-            var scriptPath = Path.Combine(gatewayPath, "src", "catpawState.js");
-            var startInfo = new ProcessStartInfo("node")
-            {
-                WorkingDirectory = gatewayPath,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-            startInfo.ArgumentList.Add(scriptPath);
-
-            process = new Process { StartInfo = startInfo };
-            if (!process.Start())
-            {
-                throw new InvalidOperationException();
-            }
-
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(ImportTimeout);
-            stdoutTask = ReadBoundedAsync(process.StandardOutput, timeout.Token);
-            stderrTask = ReadBoundedAsync(process.StandardError, timeout.Token);
-            await process.WaitForExitAsync(timeout.Token);
-            var stdout = await stdoutTask;
-            _ = await stderrTask;
-            if (process.ExitCode != 0)
-            {
-                throw new InvalidOperationException();
-            }
-
-            return stdout;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            throw new InvalidOperationException("Catpaw desktop state reader failed.");
-        }
-        finally
-        {
-            if (process is not null)
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(true);
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                }
-
-                await ObserveAsync(stdoutTask);
-                await ObserveAsync(stderrTask);
-                process.Dispose();
-            }
-        }
+        var changed = _sessionChanged;
+        _sessionChanged = NewSignal();
+        changed.TrySetResult();
     }
 
     private static async Task ObserveAsync(Task? task)
@@ -472,29 +617,6 @@ internal sealed class CatpawAuthService : IAsyncDisposable
         }
         catch
         {
-        }
-    }
-
-    private static async Task<string> ReadBoundedAsync(
-        StreamReader reader,
-        CancellationToken ct)
-    {
-        var buffer = new char[4096];
-        var output = new StringBuilder();
-        while (true)
-        {
-            var read = await reader.ReadAsync(buffer.AsMemory(), ct);
-            if (read == 0)
-            {
-                return output.ToString();
-            }
-
-            if (output.Length + read > MaxImportOutputCharacters)
-            {
-                throw new InvalidDataException();
-            }
-
-            output.Append(buffer, 0, read);
         }
     }
 
