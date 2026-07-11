@@ -1,0 +1,308 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  ResponsesStreamBuilder,
+  ResponsesSessionStore,
+  openAIResponseToResponses,
+  responsesToolMetadata,
+  responsesToOpenAIRequest,
+} from '../src/responses.js';
+
+test('responsesToOpenAIRequest maps instructions, function tools, calls, and outputs', () => {
+  const result = responsesToOpenAIRequest({
+    model: 'client-model',
+    instructions: 'Work carefully.',
+    stream: true,
+    max_output_tokens: 1200,
+    input: [
+      { role: 'user', content: [{ type: 'input_text', text: 'Inspect files' }] },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'TaskList',
+        arguments: '{}',
+      },
+      { type: 'function_call_output', call_id: 'call_1', output: 'No tasks' },
+    ],
+    tools: [{
+      type: 'function',
+      name: 'TaskList',
+      description: 'List tasks',
+      parameters: { type: 'object' },
+    }],
+    tool_choice: { type: 'function', name: 'TaskList' },
+  }, { model: 'glm-5.2' });
+
+  assert.equal(result.model, 'glm-5.2');
+  assert.equal(result.max_tokens, 1200);
+  assert.deepEqual(result.messages, [
+    { role: 'system', content: 'Work carefully.' },
+    { role: 'user', content: 'Inspect files' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_1',
+        type: 'function',
+        function: { name: 'TaskList', arguments: '{}' },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'call_1', content: 'No tasks' },
+  ]);
+  assert.deepEqual(result.tools[0], {
+    type: 'function',
+    function: {
+      name: 'TaskList',
+      description: 'List tasks',
+      parameters: { type: 'object' },
+    },
+  });
+  assert.deepEqual(result.tool_choice, {
+    type: 'function',
+    function: { name: 'TaskList' },
+  });
+});
+
+test('responsesToOpenAIRequest maps Codex custom tools to string-input functions', () => {
+  const result = responsesToOpenAIRequest({
+    model: 'codex-model',
+    input: [{
+      type: 'custom_tool_call_output',
+      call_id: 'call_patch',
+      output: 'Done',
+    }],
+    tools: [{ type: 'custom', name: 'apply_patch', description: 'Apply a patch' }],
+  }, { model: 'glm-5.2' });
+
+  assert.equal(result.messages[0].role, 'tool');
+  assert.equal(result.messages[0].tool_call_id, 'call_patch');
+  assert.deepEqual(result.tools[0].function.parameters, {
+    type: 'object',
+    properties: { input: { type: 'string' } },
+    required: ['input'],
+    additionalProperties: false,
+  });
+});
+
+test('responsesToOpenAIRequest flattens Codex namespace tools and restores calls', () => {
+  const request = {
+    model: 'gpt-5.5',
+    input: 'Inspect the runtime',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'mcp__node_repl',
+        description: 'Node REPL tools',
+        tools: [{
+          type: 'function',
+          name: 'js',
+          description: 'Evaluate JavaScript',
+          strict: false,
+          parameters: {
+            type: 'object',
+            properties: { code: { type: 'string' } },
+            required: ['code'],
+          },
+        }],
+      },
+      { type: 'web_search', external_web_access: true },
+    ],
+    tool_choice: { type: 'function', namespace: 'mcp__node_repl', name: 'js' },
+  };
+  const metadata = responsesToolMetadata(request);
+  const converted = responsesToOpenAIRequest(request, {
+    model: 'glm-5.2',
+    toolMetadata: metadata,
+  });
+
+  assert.equal(converted.tools[0].function.name, 'mcp__node_repl__js');
+  assert.equal(converted.tools.length, 1);
+  assert.match(converted.tools[0].function.description, /Namespace: mcp__node_repl/);
+  assert.deepEqual(converted.tool_choice, {
+    type: 'function',
+    function: { name: 'mcp__node_repl__js' },
+  });
+
+  const response = openAIResponseToResponses({
+    choices: [{
+      message: {
+        tool_calls: [{
+          id: 'call_js',
+          type: 'function',
+          function: { name: 'mcp__node_repl__js', arguments: '{"code":"1+1"}' },
+        }],
+      },
+    }],
+  }, {
+    responseId: 'resp_namespace',
+    namespaceTools: metadata.namespaceTools,
+  });
+  assert.equal(response.output[0].type, 'function_call');
+  assert.equal(response.output[0].name, 'js');
+  assert.equal(response.output[0].namespace, 'mcp__node_repl');
+});
+
+test('ResponsesStreamBuilder restores namespace on streamed function calls', () => {
+  const namespaceTools = new Map([[
+    'codex_app__read_thread_terminal',
+    { namespace: 'codex_app', name: 'read_thread_terminal', type: 'function' },
+  ]]);
+  const stream = new ResponsesStreamBuilder('glm-5.2', {
+    responseId: 'resp_namespace_stream',
+    namespaceTools,
+  });
+  const events = [
+    ...stream.ingest({
+      choices: [{ delta: { tool_calls: [{
+        index: 0,
+        id: 'call_terminal',
+        type: 'function',
+        function: { name: 'codex_app__read_thread_terminal', arguments: '{}' },
+      }] }, finish_reason: 'tool_calls' }],
+    }),
+    ...stream.finish(),
+  ];
+  const done = events.find((event) => (
+    event.type === 'response.output_item.done'
+    && event.item.type === 'function_call'
+  ));
+  assert.equal(done.item.name, 'read_thread_terminal');
+  assert.equal(done.item.namespace, 'codex_app');
+});
+
+test('ResponsesStreamBuilder emits text and function call events in order', () => {
+  const stream = new ResponsesStreamBuilder('glm-5.2', {
+    responseId: 'resp_test',
+    customToolNames: new Set(['apply_patch']),
+  });
+  const events = [
+    ...stream.ingest({
+      id: 'chatcmpl-1',
+      choices: [{ delta: { content: 'Hello' }, finish_reason: null }],
+    }),
+    ...stream.ingest({
+      id: 'chatcmpl-1',
+      choices: [{
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: 'call_patch',
+            type: 'function',
+            function: { name: 'apply_patch', arguments: '{"input":"patch"}' },
+          }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    }),
+    ...stream.finish(),
+  ];
+
+  assert.equal(events[0].type, 'response.created');
+  assert.ok(events.some((event) => event.type === 'response.output_text.delta'));
+  assert.ok(events.some((event) => event.type === 'response.custom_tool_call_input.delta'));
+  const toolDone = events.find((event) => (
+    event.type === 'response.output_item.done'
+    && event.item.type === 'custom_tool_call'
+  ));
+  assert.equal(toolDone.item.call_id, 'call_patch');
+  assert.equal(events.at(-1).type, 'response.completed');
+  assert.deepEqual(
+    events.map((event) => event.sequence_number),
+    events.map((_, index) => index),
+  );
+});
+
+test('openAIResponseToResponses preserves tool call IDs and usage', () => {
+  const response = openAIResponseToResponses({
+    id: 'chatcmpl-2',
+    model: 'glm-5.2',
+    choices: [{
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_2',
+          type: 'function',
+          function: { name: 'Read', arguments: '{"path":"README.md"}' },
+        }],
+      },
+    }],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  }, { responseId: 'resp_2' });
+
+  assert.equal(response.id, 'resp_2');
+  assert.equal(response.output[0].type, 'function_call');
+  assert.equal(response.output[0].call_id, 'call_2');
+  assert.deepEqual(response.usage, {
+    input_tokens: 5,
+    output_tokens: 3,
+    total_tokens: 8,
+  });
+});
+
+test('responsesToOpenAIRequest leaves previous_response_id for the session store', () => {
+  const result = responsesToOpenAIRequest({
+    model: 'glm-5.2',
+    input: 'hello',
+    previous_response_id: 'resp_previous',
+  }, { model: 'glm-5.2' });
+
+  assert.deepEqual(result.messages, [{ role: 'user', content: 'hello' }]);
+  assert.equal(result.previous_response_id, undefined);
+});
+
+test('ResponsesSessionStore resumes a tool loop from previous_response_id', () => {
+  const store = new ResponsesSessionStore({ maxSessions: 2, ttlMs: 60_000 });
+  store.record('resp_first', {
+    model: 'glm-5.2',
+    messages: [{ role: 'user', content: 'Inspect files' }],
+  }, {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'TaskList', arguments: '{}' },
+        }],
+      },
+    }],
+  }, new Set(['apply_patch']));
+
+  const resumed = store.resume('resp_first', {
+    model: 'glm-5.2',
+    messages: [{ role: 'tool', tool_call_id: 'call_1', content: 'No tasks' }],
+  });
+  assert.equal(resumed.request.messages.length, 3);
+  assert.equal(resumed.request.messages[0].content, 'Inspect files');
+  assert.equal(resumed.request.messages[1].tool_calls[0].id, 'call_1');
+  assert.equal(resumed.request.messages[2].role, 'tool');
+  assert.deepEqual(resumed.customToolNames, new Set(['apply_patch']));
+  assert.throws(() => store.resume('resp_missing', { messages: [] }), {
+    message: /previous response was not found/,
+  });
+});
+
+test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {
+  const store = new ResponsesSessionStore({
+    maxSessions: 10,
+    ttlMs: 60_000,
+    maxSessionChars: 220,
+    maxTotalChars: 300,
+  });
+  const response = { choices: [{ message: { role: 'assistant', content: 'B'.repeat(20) } }] };
+  assert.equal(store.record('resp_one', {
+    messages: [{ role: 'user', content: 'A'.repeat(80) }],
+  }, response), true);
+  assert.equal(store.record('resp_two', {
+    messages: [{ role: 'user', content: 'C'.repeat(80) }],
+  }, response), true);
+
+  assert.throws(() => store.resume('resp_one', { messages: [] }), /previous response was not found/);
+  assert.equal(store.resume('resp_two', { messages: [] }).request.messages.length, 2);
+  assert.equal(store.record('resp_oversized', {
+    messages: [{ role: 'user', content: 'X'.repeat(500) }],
+  }, response), false);
+});

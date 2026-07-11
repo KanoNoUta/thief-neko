@@ -10,6 +10,302 @@ import { CredentialBroker } from '../src/credentialBroker.js';
 import { loadConfig } from '../src/config.js';
 import { UsageStore } from '../src/usageStore.js';
 
+test('gateway relays an OpenAI Chat Completions tool loop', async (t) => {
+  const upstreamRequests = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJson(req);
+    upstreamRequests.push(body);
+    const hasToolResult = body.messages.some((message) => message.role === 'tool');
+    const chunk = hasToolResult
+      ? {
+          id: 'chatcmpl-openai-2',
+          content: 'OPENAI_TOOL_LOOP_OK',
+          choices: [{ finishReason: 'stop' }],
+          lastOne: true,
+          statusCode: 0,
+        }
+      : {
+          id: 'chatcmpl-openai-1',
+          toolCalls: [{
+            id: 'call_openai_1',
+            type: 'function',
+            function: { name: 'TaskList', arguments: '{}' },
+          }],
+          choices: [{ finishReason: 'tool_calls' }],
+          lastOne: true,
+          statusCode: 0,
+        };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify(chunk)}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createTestGateway(upstream, null);
+  await listen(gateway);
+  t.after(() => gateway.close());
+  const url = `http://127.0.0.1:${gateway.address().port}/v1/chat/completions`;
+  const tools = [{
+    type: 'function',
+    function: { name: 'TaskList', description: 'List tasks', parameters: { type: 'object' } },
+  }];
+
+  const first = await postJson(url, {
+    model: 'glm-5.2',
+    stream: false,
+    messages: [{ role: 'user', content: 'List tasks' }],
+    tools,
+  });
+  const firstBody = JSON.parse(first);
+  assert.equal(firstBody.choices[0].finish_reason, 'tool_calls');
+  assert.equal(firstBody.choices[0].message.tool_calls[0].function.name, 'TaskList');
+
+  const second = await postJson(url, {
+    model: 'glm-5.2',
+    stream: true,
+    messages: [
+      { role: 'user', content: 'List tasks' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_openai_1',
+          type: 'function',
+          function: { name: 'TaskList', arguments: '{}' },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'call_openai_1', content: 'No tasks' },
+    ],
+    tools,
+  });
+  assert.match(second, /OPENAI_TOOL_LOOP_OK/);
+  assert.match(second, /data: \[DONE\]/);
+  assert.equal(upstreamRequests.length, 2);
+  assert.equal(upstreamRequests[1].conversationId, upstreamRequests[0].conversationId);
+  assert.equal(
+    upstreamRequests[1].messages.find((message) => message.role === 'tool').tool_call_name,
+    'TaskList',
+  );
+});
+
+test('gateway relays an OpenAI Responses custom tool loop', async (t) => {
+  const upstreamRequests = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJson(req);
+    upstreamRequests.push(body);
+    const hasToolResult = body.messages.some((message) => message.role === 'tool');
+    const chunk = hasToolResult
+      ? {
+          id: 'chatcmpl-responses-2',
+          content: 'RESPONSES_TOOL_LOOP_OK',
+          choices: [{ finishReason: 'stop' }],
+          lastOne: true,
+          statusCode: 0,
+        }
+      : {
+          id: 'chatcmpl-responses-1',
+          toolCalls: [{
+            id: 'call_patch_1',
+            type: 'function',
+            function: { name: 'apply_patch', arguments: '{"input":"patch body"}' },
+          }],
+          choices: [{ finishReason: 'tool_calls' }],
+          lastOne: true,
+          statusCode: 0,
+        };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify(chunk)}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createTestGateway(upstream, null);
+  await listen(gateway);
+  t.after(() => gateway.close());
+  const url = `http://127.0.0.1:${gateway.address().port}/v1/responses`;
+  const tools = [{ type: 'custom', name: 'apply_patch', description: 'Apply patch text' }];
+
+  const first = await postJson(url, {
+    model: 'codex-model',
+    stream: true,
+    input: 'Update the file',
+    tools,
+  });
+  assert.match(first, /response\.custom_tool_call_input\.done/);
+  assert.match(first, /"call_id":"call_patch_1"/);
+  assert.match(first, /"input":"patch body"/);
+  assert.match(first, /data: \[DONE\]/);
+  const previousResponseId = first.match(/"id":"(resp_[^"]+)"/)?.[1];
+  assert.ok(previousResponseId);
+
+  const second = await postJson(url, {
+    model: 'codex-model',
+    stream: false,
+    previous_response_id: previousResponseId,
+    input: [{ type: 'custom_tool_call_output', call_id: 'call_patch_1', output: 'Done' }],
+    tools,
+  });
+  const secondBody = JSON.parse(second);
+  assert.equal(secondBody.object, 'response');
+  assert.equal(secondBody.status, 'completed');
+  assert.equal(secondBody.output[0].content[0].text, 'RESPONSES_TOOL_LOOP_OK');
+  assert.equal(upstreamRequests.length, 2);
+  assert.equal(upstreamRequests[1].conversationId, upstreamRequests[0].conversationId);
+  assert.equal(
+    upstreamRequests[1].messages.find((message) => message.role === 'tool').tool_call_name,
+    'apply_patch',
+  );
+});
+
+test('gateway relays Codex namespace tools and ignores hosted web search', async (t) => {
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    const chunk = {
+      id: 'chatcmpl-namespace-1',
+      toolCalls: [{
+        id: 'call_terminal_1',
+        type: 'function',
+        function: {
+          name: 'codex_app__read_thread_terminal',
+          arguments: '{}',
+        },
+      }],
+      choices: [{ finishReason: 'tool_calls' }],
+      lastOne: true,
+      statusCode: 0,
+    };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify(chunk)}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createTestGateway(upstream, null);
+  await listen(gateway);
+  t.after(() => gateway.close());
+  const body = await postJson(
+    `http://127.0.0.1:${gateway.address().port}/v1/responses`,
+    {
+      model: 'gpt-5.5',
+      stream: true,
+      input: 'Read the terminal',
+      tools: [
+        {
+          type: 'namespace',
+          name: 'codex_app',
+          description: 'Codex desktop tools',
+          tools: [{
+            type: 'function',
+            name: 'read_thread_terminal',
+            description: 'Read the terminal',
+            strict: false,
+            parameters: { type: 'object', properties: {} },
+          }],
+        },
+        { type: 'web_search', external_web_access: true },
+      ],
+    },
+  );
+
+  assert.match(body, /"type":"function_call"/);
+  assert.match(body, /"name":"read_thread_terminal"/);
+  assert.match(body, /"namespace":"codex_app"/);
+  assert.match(body, /data: \[DONE\]/);
+});
+
+test('gateway exposes an OpenAI-compatible model list', async (t) => {
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    model: 'glm-5.2',
+    upstreamUrl: 'http://127.0.0.1:1/unused',
+    nativeAgent: true,
+    forceStream: true,
+    encrypt: false,
+    extraHeaders: {},
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const response = await fetch(`http://127.0.0.1:${gateway.address().port}/v1/models`);
+  const body = await response.json();
+  assert.equal(body.object, 'list');
+  assert.equal(body.data[0].object, 'model');
+  assert.equal(body.data[0].id, 'glm-5.2');
+});
+
+test('gateway protects public API endpoints with the configured bearer key', async (t) => {
+  const gateway = createGatewayServer({
+    listenHost: '0.0.0.0',
+    inboundApiKey: 'new-api-channel-secret',
+    model: 'glm-5.2',
+    upstreamUrl: 'http://127.0.0.1:1/unused',
+    nativeAgent: true,
+    forceStream: true,
+    encrypt: false,
+    extraHeaders: {},
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+  const url = `http://127.0.0.1:${gateway.address().port}/v1/models`;
+
+  const rejected = await fetch(url);
+  assert.equal(rejected.status, 401);
+  const accepted = await fetch(url, {
+    headers: { authorization: 'Bearer new-api-channel-secret' },
+  });
+  assert.equal(accepted.status, 200);
+});
+
+test('gateway exposes Catpaw request quota through OpenAI billing endpoints', async (t) => {
+  let quotaRequests = 0;
+  const upstream = http.createServer((req, res) => {
+    quotaRequests += 1;
+    assert.equal(req.url, '/api/user/limit');
+    sendJson(res, {
+      code: 0,
+      data: {
+        modelRequestCount: 17,
+        modelRequestLimit: 500,
+        modelRemaingCount: 483,
+      },
+    });
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    inboundApiKey: 'new-api-channel-secret',
+    upstreamBaseUrl: baseUrl,
+    upstreamUrl: `${baseUrl}/unused`,
+    model: 'glm-5.2',
+    extraHeaders: { 'Catpaw-Auth': 'quota-token' },
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const origin = `http://127.0.0.1:${gateway.address().port}`;
+  const headers = { authorization: 'Bearer new-api-channel-secret' };
+  const subscriptionResponse = await fetch(
+    `${origin}/v1/dashboard/billing/subscription`,
+    { headers },
+  );
+  const usageResponse = await fetch(
+    `${origin}/v1/dashboard/billing/usage?start_date=2026-07-01&end_date=2026-07-12`,
+    { headers },
+  );
+  const subscription = await subscriptionResponse.json();
+  const usage = await usageResponse.json();
+
+  assert.equal(subscriptionResponse.status, 200);
+  assert.equal(subscription.hard_limit_usd, 500);
+  assert.equal(subscription.system_hard_limit_usd, 500);
+  assert.equal(usageResponse.status, 200);
+  assert.equal(usage.total_usage, 1700);
+  assert.equal(quotaRequests, 1);
+});
+
 test('gateway uses Catpaw native Agent protocol for a complete Claude tool loop', async (t) => {
   const upstreamRequests = [];
   const upstreamHeaders = [];
@@ -779,6 +1075,98 @@ test('gateway status reads Catpaw quota from the user limit endpoint', async (t)
   assert.deepEqual(status.quota, { remaining: 383, used: 117, total: 500 });
   assert.equal(quotaToken, 'broker-quota-token');
   assert.equal(snapshots, 1);
+});
+
+test('gateway automatically resets Catpaw quota below four credits once', async (t) => {
+  let limitRequests = 0;
+  let resetRequests = 0;
+  const upstream = http.createServer(async (req, res) => {
+    if (req.url === '/api/user/limit') {
+      limitRequests += 1;
+      sendJson(res, {
+        code: 0,
+        data: {
+          modelRequestCount: 497,
+          modelRequestLimit: 500,
+          modelRemaingCount: 3,
+        },
+      });
+      return;
+    }
+    assert.equal(req.url, '/api/user/addQuota');
+    assert.equal(req.method, 'POST');
+    assert.deepEqual(await readJson(req), {});
+    resetRequests += 1;
+    sendJson(res, {
+      code: 0,
+      data: {
+        modelRequestCount: 497,
+        modelRequestLimit: 1000,
+        modelRemaingCount: 503,
+      },
+    });
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamBaseUrl: baseUrl,
+    upstreamUrl: `${baseUrl}/unused`,
+    model: 'glm-5.2',
+    autoResetQuota: true,
+    extraHeaders: { 'Catpaw-Auth': 'quota-token' },
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const statusUrl = `http://127.0.0.1:${gateway.address().port}/admin/status`;
+  const first = await (await fetch(statusUrl)).json();
+  const second = await (await fetch(statusUrl)).json();
+
+  assert.deepEqual(first.quota, { remaining: 503, used: 497, total: 1000 });
+  assert.equal(first.quotaAutoReset.enabled, true);
+  assert.equal(first.quotaAutoReset.threshold, 4);
+  assert.equal(typeof first.quotaAutoReset.lastSuccessAt, 'string');
+  assert.equal(second.quota.remaining, 503);
+  assert.equal(limitRequests, 1);
+  assert.equal(resetRequests, 1);
+});
+
+test('gateway does not reset Catpaw quota at four credits', async (t) => {
+  let resetRequests = 0;
+  const upstream = http.createServer((req, res) => {
+    if (req.url === '/api/user/addQuota') resetRequests += 1;
+    sendJson(res, {
+      code: 0,
+      data: {
+        modelRequestCount: 496,
+        modelRequestLimit: 500,
+        modelRemaingCount: 4,
+      },
+    });
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamBaseUrl: baseUrl,
+    upstreamUrl: `${baseUrl}/unused`,
+    model: 'glm-5.2',
+    autoResetQuota: true,
+    extraHeaders: { 'Catpaw-Auth': 'quota-token' },
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const status = await (await fetch(
+    `http://127.0.0.1:${gateway.address().port}/admin/status`,
+  )).json();
+  assert.equal(status.quota.remaining, 4);
+  assert.equal(resetRequests, 0);
 });
 
 test('concurrent status callers await one in-flight quota refresh', async (t) => {

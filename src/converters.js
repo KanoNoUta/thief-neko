@@ -46,6 +46,30 @@ export function anthropicToOpenAIRequest(request, options) {
   return body;
 }
 
+export function prepareOpenAIRequestForCatpaw(request, options = {}) {
+  if (!Array.isArray(request.tools) || request.tools.length === 0) {
+    return request;
+  }
+  const messages = (request.messages || []).map((message) => ({ ...message }));
+  const systemIndex = messages.findIndex((message) => message.role === 'system');
+  const existingSystem = systemIndex >= 0 ? contentToText(messages[systemIndex].content) : '';
+  if (existingSystem.includes(TOOL_PROTOCOL_INSTRUCTION)) {
+    return { ...request, messages };
+  }
+  const content = prepareSystemText(
+    existingSystem,
+    options.maxSystemChars,
+    true,
+    options.workspaceContext,
+  );
+  if (systemIndex >= 0) {
+    messages[systemIndex] = { ...messages[systemIndex], content };
+  } else {
+    messages.unshift({ role: 'system', content });
+  }
+  return { ...request, messages };
+}
+
 function requestHasToolResult(request) {
   return (request.messages || []).some((message) => (
     Array.isArray(message.content)

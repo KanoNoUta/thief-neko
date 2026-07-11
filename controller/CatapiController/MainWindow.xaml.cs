@@ -17,6 +17,10 @@ public partial class MainWindow : Window
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
     private readonly SettingsStore _settingsStore = new();
+    private readonly AuthSessionStore _authSessionStore = new();
+    private readonly HttpClient _authHttp = new();
+    private readonly CatpawAuthClient _authClient;
+    private readonly CatpawAuthService _authService;
     private readonly DispatcherTimer _pollTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly Forms.NotifyIcon _trayIcon;
     private Process? _gatewayProcess;
@@ -32,10 +36,14 @@ public partial class MainWindow : Window
     private DateTime _rangeStart = DateTime.Today;
     private DateTime _rangeEnd = DateTime.Today;
     private CancellationTokenSource? _revealCancellation;
+    private CredentialPipeServer? _credentialPipe;
 
     public MainWindow()
     {
         InitializeComponent();
+        _authClient = new CatpawAuthClient(_authHttp, "5282fa6645");
+        _authService = new CatpawAuthService(_authClient, _authSessionStore, "5282fa6645");
+        AuthModeCombo.SelectedIndex = 0;
         ApplyRangePreset(1, refresh: false);
         _gatewayPath = LocateGatewayRoot();
         _pollTimer.Tick += async (_, _) => await RefreshStatusAsync();
@@ -52,7 +60,12 @@ public partial class MainWindow : Window
             {
                 SetTokenValue(settings.Token);
                 TenantTextBox.Text = settings.Tenant;
-                AutoTokenToggle.IsChecked = settings.AutoToken;
+                AuthModeCombo.SelectedIndex = settings.AuthenticationMode switch
+                {
+                    AuthenticationMode.Headless => 0,
+                    AuthenticationMode.FollowDesktop => 1,
+                    _ => 2,
+                };
                 if (Directory.Exists(settings.GatewayPath))
                 {
                     _gatewayPath = settings.GatewayPath;
@@ -64,6 +77,8 @@ public partial class MainWindow : Window
             AddActivity($"配置读取失败 · {error.Message}");
         }
 
+        await _authService.GetSessionAsync();
+        UpdateAuthStatus();
         await RefreshStatusAsync();
         _pollTimer.Start();
     }
@@ -126,6 +141,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
+            await CleanupGatewayCredentialsAsync();
             ShowError(error.Message);
         }
         finally
@@ -150,6 +166,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
+            await CleanupGatewayCredentialsAsync();
             ShowError(error.Message);
         }
         finally
@@ -172,20 +189,33 @@ public partial class MainWindow : Window
         }
 
         var settings = CurrentSettings();
-        var session = settings.AutoToken
+        var session = settings.AuthenticationMode == AuthenticationMode.FollowDesktop
             ? await ReadCatpawSessionAsync(settings.GatewayPath)
             : null;
-        var tokenResolution = TokenResolver.Resolve(settings, session);
-        settings = tokenResolution.Settings;
-        if (tokenResolution.Synced)
+        if (settings.AuthenticationMode != AuthenticationMode.Headless)
         {
-            SetTokenValue(settings.Token);
-            await _settingsStore.SaveAsync(settings);
-            AddActivity("已自动同步 Catpaw Token");
+            var tokenResolution = TokenResolver.Resolve(settings, session);
+            settings = tokenResolution.Settings;
+            if (tokenResolution.Synced)
+            {
+                SetTokenValue(settings.Token);
+                await _settingsStore.SaveAsync(settings);
+                AddActivity("已自动同步 Catpaw Token");
+            }
+            else if (tokenResolution.UsedFallback)
+            {
+                AddActivity("自动获取失败，已使用手动 Token");
+            }
         }
-        else if (tokenResolution.UsedFallback)
+        else
         {
-            AddActivity("自动获取失败，已使用手动 Token");
+            if (await _authService.GetSessionAsync() is null)
+            {
+                throw new InvalidOperationException("Login to Catpaw before starting the headless gateway.");
+            }
+            await _authService.StartAsync();
+            _credentialPipe = new CredentialPipeServer(_authService);
+            await _credentialPipe.StartAsync();
         }
 
         var startInfo = new ProcessStartInfo("node")
@@ -197,7 +227,8 @@ public partial class MainWindow : Window
             RedirectStandardError = true,
         };
         startInfo.ArgumentList.Add("src/server.js");
-        ApplyGatewayEnvironment(startInfo, settings, session?.UserMis ?? "");
+        GatewayLaunchEnvironment.Apply(startInfo, settings, session?.UserMis ?? "",
+            _credentialPipe?.PipeName, _credentialPipe?.Nonce);
 
         _gatewayProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         _gatewayProcess.OutputDataReceived += (_, e) => RecordProcessLine(e.Data);
@@ -251,6 +282,7 @@ public partial class MainWindow : Window
     {
         if (ownedOnly && !_ownsGateway)
         {
+            await CleanupGatewayCredentialsAsync();
             return;
         }
 
@@ -276,8 +308,19 @@ public partial class MainWindow : Window
         _gatewayProcess = null;
         _gatewayPid = null;
         _ownsGateway = false;
+        await CleanupGatewayCredentialsAsync();
         SetRunning(false);
         AddActivity("网关已停止");
+    }
+
+    private async Task CleanupGatewayCredentialsAsync()
+    {
+        if (_credentialPipe is not null)
+        {
+            await _credentialPipe.DisposeAsync();
+            _credentialPipe = null;
+        }
+        await _authService.StopAsync();
     }
 
     private async Task RefreshStatusAsync()
@@ -563,6 +606,7 @@ public partial class MainWindow : Window
 
     private void AddActivity(string message)
     {
+        message = ControllerPresentation.RedactActivity(message);
         Dispatcher.Invoke(() =>
         {
             ActivityList.Items.Insert(0, $"{DateTime.Now:HH:mm:ss}  {message}");
@@ -585,25 +629,51 @@ public partial class MainWindow : Window
         TokenPasswordBox.Password.Trim(),
         TenantTextBox.Text.Trim(),
         _gatewayPath,
-        AutoTokenToggle.IsChecked == true);
+        AuthModeCombo.SelectedIndex switch
+        {
+            0 => AuthenticationMode.Headless,
+            1 => AuthenticationMode.FollowDesktop,
+            _ => AuthenticationMode.Manual,
+        });
 
-    private static void ApplyGatewayEnvironment(ProcessStartInfo info, ControllerSettings settings, string userMis)
+    private void AuthModeCombo_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        info.Environment["CATPAW_BASE_URL"] = "https://catpaw.meituan.com";
-        info.Environment["CATPAW_UPSTREAM_URL"] = "https://catpaw.meituan.com/api/gpt/openai/stream";
-        info.Environment["CATPAW_MODEL"] = "glm-5.2";
-        info.Environment["CATPAW_AUTH_TOKEN"] = settings.Token;
-        info.Environment["CATPAW_COOKIE"] = $"1d47d6ff96_passportid={settings.Token}; f32a546874_ssoid={settings.Token}";
-        info.Environment["CATPAW_TENANT"] = settings.Tenant;
-        info.Environment["CATPAW_USER_MIS_ID"] = userMis;
-        info.Environment["CATPAW_ENCRYPT"] = "1";
-        info.Environment["CATPAW_FORCE_STREAM"] = "1";
-        info.Environment["CATPAW_NATIVE_AGENT"] = "1";
-        info.Environment["CATPAW_AUTO_REFRESH_TOKEN"] = settings.AutoToken ? "1" : "0";
-        info.Environment["CATPAW_MODEL_TYPE"] = "2";
-        info.Environment["CATPAW_DEBUG"] = "0";
-        info.Environment["CATPAW_HEADERS"] = "{\"ide-type\":\"CatPaw IDE\",\"client-type\":\"CatPaw IDE\",\"ide-version\":\"2026.2.3\",\"plugin-id\":\"mt-idekit.mt-idekit-code\",\"plugin-version\":\"2026.2.2\",\"client-env\":\"LOCAL_IDE\",\"platform-info\":\"win32-x64\",\"UI-Version\":\"0.2.2\"}";
+        if (!IsInitialized) return;
+        var manual = AuthModeCombo.SelectedIndex == 2;
+        TokenPasswordBox.IsEnabled = manual;
+        TokenRevealBox.IsEnabled = manual;
+        RevealButton.IsEnabled = manual;
     }
+
+    private async void LoginCatpaw_Click(object sender, RoutedEventArgs e)
+    {
+        var window = new LoginWindow(_authClient, _authService) { Owner = this };
+        window.ShowDialog();
+        UpdateAuthStatus();
+        if (_authService.GetStatus().SignedIn)
+        {
+            AuthModeCombo.SelectedIndex = 0;
+            await SaveSettingsAsync();
+        }
+    }
+
+    private async void ImportLogin_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            SetBusy(true, "Importing Catpaw login...");
+            await _authService.ImportDesktopSessionAsync(_gatewayPath, CancellationToken.None);
+            AuthModeCombo.SelectedIndex = 0;
+            UpdateAuthStatus();
+            await SaveSettingsAsync();
+            AddActivity("Catpaw login imported");
+        }
+        catch (Exception error) { ShowError(error.Message); }
+        finally { SetBusy(false); }
+    }
+
+    private void UpdateAuthStatus() => AuthStatusText.Text =
+        ControllerPresentation.FormatAuthStatus(_authService.GetStatus());
 
     private static async Task<CatpawSession?> ReadCatpawSessionAsync(string gatewayPath)
     {
@@ -776,9 +846,11 @@ public partial class MainWindow : Window
         _pollTimer.Stop();
         _revealCancellation?.Cancel();
         await StopGatewayCoreAsync(true);
+        await _authService.DisposeAsync();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _http.Dispose();
+        _authHttp.Dispose();
         Close();
         System.Windows.Application.Current.Shutdown();
     }

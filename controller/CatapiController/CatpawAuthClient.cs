@@ -93,7 +93,7 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
             "QR challenge", ct);
         var code = RequiredString(data, "QR challenge", "code");
         var qrCodeUrl = RequiredHttpsUrl(data, "QR challenge",
-            "qrcodeUrl", "qrCodeUrl", "url", "qrcode");
+            "qrCodeImageUrl", "qrcodeUrl", "qrCodeUrl", "url", "qrcode");
         var expiresAt = RequiredDateTime(data, "QR challenge",
             "expiresAt", "expireTime", "expirationTime");
         return new QrLoginChallenge(code, qrCodeUrl, expiresAt);
@@ -103,12 +103,18 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
     {
         var data = await SendAsync(HttpMethod.Post, "/api/login/accessToken",
             new Dictionary<string, object?> { ["code"] = code }, null, _tenant, "QR poll", ct);
-        var status = NormalizePollStatus(RequiredString(
-            data, "QR poll", "status", "state", "loginStatus"));
+        var rawStatus = OptionalString(data, "QR poll", "status", "state", "loginStatus");
+        var scanned = OptionalStrictBoolean(data, "QR poll", "scanned");
         var mobileBound = OptionalStrictBoolean(data, "QR poll", "mobileBound");
         var explicitBinding = OptionalStrictBoolean(data, "QR poll",
             "requiresMobileBinding", "needBindMobile", "mobileBindingRequired");
-        var requiresBinding = explicitBinding ?? (mobileBound is false);
+        var status = rawStatus is not null
+            ? NormalizePollStatus(rawStatus)
+            : mobileBound is true
+                ? "mobileBound"
+                : scanned is true ? "scanned" : "pending";
+        var requiresBinding = explicitBinding
+            ?? ((scanned is true || status == "scanned") && mobileBound is false);
 
         var hasTokenFields = HasAnyProperty(data, "accessToken", "refreshToken");
         var isTerminal = status is "confirmed" or "mobileBound";
@@ -120,7 +126,7 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
         AuthSession? session = null;
         if (hasTokenFields)
         {
-            session = ParseSession(data, _tenant, "QR poll");
+            session = await ParseAndEnrichSessionAsync(data, _tenant, "QR poll", ct);
         }
 
         return new QrLoginPoll(status, session, requiresBinding);
@@ -138,7 +144,7 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
                 ["uuid"] = deviceId,
             }, null, _tenant, "SMS request", ct);
         return new SmsChallenge(
-            RequiredString(data, "SMS request", "uuid"),
+            OptionalString(data, "SMS request", "uuid") ?? deviceId,
             OptionalString(data, "SMS request", "requestCode"));
     }
 
@@ -154,7 +160,8 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
                 ["verificationCode"] = code,
             }, null, _tenant, "SMS verification", ct);
         return new MobileVerification(
-            RequiredBoolean(data, "SMS verification", "verified", "valid", "success"),
+            OptionalStrictBoolean(data, "SMS verification", "verified", "valid", "success")
+                ?? true,
             RequiredBoolean(data, "SMS verification",
                 "invitationCodeRequired", "needInvitationCode", "invitationRequired"));
     }
@@ -168,7 +175,7 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
         var body = MobileBody(mobile, code, invitation);
         var data = await SendAsync(HttpMethod.Post, "/api/login/mobile", body, null, _tenant,
             "mobile login", ct);
-        return ParseSession(data, _tenant, "mobile login");
+        return await ParseAndEnrichSessionAsync(data, _tenant, "mobile login", ct);
     }
 
     public async Task<AuthSession> BindMobileAsync(
@@ -186,7 +193,7 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
 
         var data = await SendAsync(HttpMethod.Post, "/api/login/bindMobile", body, null, _tenant,
             "mobile binding", ct);
-        return ParseSession(data, _tenant, "mobile binding");
+        return await ParseAndEnrichSessionAsync(data, _tenant, "mobile binding", ct);
     }
 
     public async Task<AuthSession> RefreshAsync(AuthSession current, CancellationToken ct)
@@ -218,8 +225,9 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
         var data = await SendAsync(HttpMethod.Get, "/api/login/userInfo", null, accessToken, _tenant,
             "user info", ct);
         return new AccountInfo(
-            RequiredString(data, "user info", "userId", "id", "userMis"),
-            RequiredString(data, "user info", "accountLabel", "accountName", "name", "nickname"));
+            RequiredString(data, "user info", "userId", "id", "userMis", "uid"),
+            RequiredString(data, "user info",
+                "accountLabel", "accountName", "name", "nickname", "loginName"));
     }
 
     private async Task<JsonElement> SendAsync(
@@ -265,9 +273,19 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
 
             try
             {
-                await using var stream = await response.Content.ReadAsStreamAsync(operationToken);
-                using var document = await JsonDocument.ParseAsync(
-                    stream, cancellationToken: operationToken);
+                var responseBody = await response.Content.ReadAsStringAsync(operationToken);
+                if (response.Headers.TryGetValues("encrypted-key", out var encryptedKeys))
+                {
+                    var encryptedKey = encryptedKeys.SingleOrDefault();
+                    if (string.IsNullOrWhiteSpace(encryptedKey))
+                    {
+                        throw Failure(operation, "invalid encrypted response");
+                    }
+                    responseBody = CatpawProtocolCrypto.DecryptResponse(
+                        responseBody, encryptedKey);
+                }
+
+                using var document = JsonDocument.Parse(responseBody);
                 var root = document.RootElement;
                 if (root.ValueKind != JsonValueKind.Object ||
                     !root.TryGetProperty("code", out var codeElement) ||
@@ -345,9 +363,31 @@ internal sealed class CatpawAuthClient : ICatpawAuthClient, ICatpawLoginClient
             accountLabel,
             tenant,
             OptionalDateTime(data, operation,
-                "accessExpiresAt", "accessTokenExpiresAt", "expiresAt"),
-            OptionalDateTime(data, operation, "refreshExpiresAt", "refreshTokenExpiresAt"),
+                "accessExpiresAt", "accessTokenExpiresAt", "expiresAt", "expires"),
+            OptionalDateTime(data, operation,
+                "refreshExpiresAt", "refreshTokenExpiresAt", "refreshExpires"),
             DateTimeOffset.UtcNow);
+    }
+
+    private async Task<AuthSession> ParseAndEnrichSessionAsync(
+        JsonElement data,
+        string tenant,
+        string operation,
+        CancellationToken ct)
+    {
+        var session = ParseSession(data, tenant, operation, requireIdentity: false);
+        if (!string.IsNullOrWhiteSpace(session.UserId) &&
+            !string.IsNullOrWhiteSpace(session.AccountLabel))
+        {
+            return session;
+        }
+
+        var account = await GetUserInfoAsync(session.AccessToken, ct);
+        return session with
+        {
+            UserId = account.UserId,
+            AccountLabel = account.AccountLabel,
+        };
     }
 
     private static string RequiredString(JsonElement data, string operation, params string[] names)

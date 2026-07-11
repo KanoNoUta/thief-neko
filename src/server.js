@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
@@ -6,6 +7,7 @@ import {
   anthropicToOpenAIRequest,
   normalizeOpenAIResponse,
   openAIToAnthropicMessage,
+  prepareOpenAIRequestForCatpaw,
 } from './converters.js';
 import {
   AnthropicStreamBuilder,
@@ -26,8 +28,20 @@ import {
   getCredentialSnapshot,
 } from './catpawCredentials.js';
 import { CredentialBroker } from './credentialBroker.js';
+import { CatpawAuthClient } from './catpawAuthClient.js';
+import { EncryptedSessionStore } from './encryptedSessionStore.js';
+import { HeadlessCredentialProvider } from './headlessCredentialProvider.js';
 import { readCatpawSessionAsync } from './catpawState.js';
 import { UsageStore, formatLocalDate, parseDateKey } from './usageStore.js';
+import { OpenAIStreamAccumulator, normalizeOpenAIRequest } from './openai.js';
+import {
+  ResponsesStreamBuilder,
+  ResponsesSessionStore,
+  createResponseId,
+  openAIResponseToResponses,
+  responsesToolMetadata,
+  responsesToOpenAIRequest,
+} from './responses.js';
 
 export function createGatewayServer(config, dependencies = {}) {
   const limits = {
@@ -44,6 +58,10 @@ export function createGatewayServer(config, dependencies = {}) {
     maxSessions: limits.maxAgentSessions,
     ttlMs: limits.agentSessionTtlMs,
     maxSuggestMappings: limits.maxSuggestMappings,
+  });
+  const responsesSessions = new ResponsesSessionStore({
+    maxSessions: limits.maxAgentSessions,
+    ttlMs: limits.agentSessionTtlMs,
   });
   const usageStore = config.usageStore || new UsageStore(config.usageStorePath);
   const credentialProvider = dependencies.credentialProvider
@@ -65,6 +83,7 @@ export function createGatewayServer(config, dependencies = {}) {
         config,
         limits,
         agentSessions,
+        responsesSessions,
         metrics,
         credentialProvider,
       );
@@ -92,6 +111,7 @@ async function routeRequest(
   config,
   limits,
   agentSessions,
+  responsesSessions,
   metrics,
   credentialProvider,
 ) {
@@ -114,9 +134,28 @@ async function routeRequest(
     return;
   }
 
+  if (url.pathname.startsWith('/v1/') && !isAuthorizedClient(req, config.inboundApiKey)) {
+    sendJson(res, 401, {
+      error: {
+        message: 'Invalid or missing API key',
+        type: 'invalid_request_error',
+        code: 'invalid_api_key',
+      },
+    });
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     sendJson(res, 200, {
-      data: [{ id: config.model, type: 'model', display_name: config.model }],
+      object: 'list',
+      data: [{
+        id: config.model,
+        object: 'model',
+        created: 0,
+        owned_by: 'thief-neko',
+        type: 'model',
+        display_name: config.model,
+      }],
       has_more: false,
     });
     return;
@@ -131,6 +170,71 @@ async function routeRequest(
         config,
         limits,
         agentSessions,
+        metrics,
+        credentialProvider,
+      );
+      metrics.completeRequest(true);
+    } catch (error) {
+      metrics.completeRequest(false, error.statusCode || 500);
+      throw error;
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/v1/dashboard/billing/subscription') {
+    await metrics.refreshQuota();
+    const quota = metrics.quotaSnapshot();
+    sendJson(res, 200, {
+      object: 'billing_subscription',
+      has_payment_method: true,
+      soft_limit_usd: quota.total,
+      hard_limit_usd: quota.total,
+      system_hard_limit_usd: quota.total,
+      access_until: 0,
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/v1/dashboard/billing/usage') {
+    await metrics.refreshQuota();
+    const quota = metrics.quotaSnapshot();
+    sendJson(res, 200, {
+      object: 'list',
+      total_usage: quota.used * 100,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+    metrics.beginRequest();
+    try {
+      await handleChatCompletions(
+        req,
+        res,
+        config,
+        limits,
+        agentSessions,
+        metrics,
+        credentialProvider,
+      );
+      metrics.completeRequest(true);
+    } catch (error) {
+      metrics.completeRequest(false, error.statusCode || 500);
+      throw error;
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/v1/responses') {
+    metrics.beginRequest();
+    try {
+      await handleResponses(
+        req,
+        res,
+        config,
+        limits,
+        agentSessions,
+        responsesSessions,
         metrics,
         credentialProvider,
       );
@@ -169,6 +273,125 @@ async function handleMessages(
     maxToolDescriptionChars: config.maxToolDescriptionChars,
     workspaceContext,
   });
+  await handleNormalizedRequest(
+    res,
+    config,
+    limits,
+    agentSessions,
+    metrics,
+    credentialProvider,
+    openAIRequest,
+    workspaceContext,
+    'anthropic',
+  );
+}
+
+async function handleChatCompletions(
+  req,
+  res,
+  config,
+  limits,
+  agentSessions,
+  metrics,
+  credentialProvider,
+) {
+  const request = await readJson(req, limits.maxRequestBytes);
+  const workspaceContext = await resolveClaudeWorkspaceContext({
+    root: config.claudeSessionRoot,
+    headers: req.headers,
+    metadata: request.metadata,
+  });
+  const openAIRequest = prepareOpenAIRequestForCatpaw(
+    normalizeOpenAIRequest(request, { model: config.model }),
+    {
+      maxSystemChars: config.maxSystemChars,
+      workspaceContext,
+    },
+  );
+  await handleNormalizedRequest(
+    res,
+    config,
+    limits,
+    agentSessions,
+    metrics,
+    credentialProvider,
+    openAIRequest,
+    workspaceContext,
+    'openai',
+  );
+}
+
+async function handleResponses(
+  req,
+  res,
+  config,
+  limits,
+  agentSessions,
+  responsesSessions,
+  metrics,
+  credentialProvider,
+) {
+  const request = await readJson(req, limits.maxRequestBytes);
+  const workspaceContext = await resolveClaudeWorkspaceContext({
+    root: config.claudeSessionRoot,
+    headers: req.headers,
+    metadata: request.metadata,
+  });
+  const toolMetadata = responsesToolMetadata(request);
+  let openAIRequest = responsesToOpenAIRequest(request, {
+    model: config.model,
+    toolMetadata,
+  });
+  let customToolNames = toolMetadata.customToolNames;
+  let namespaceTools = toolMetadata.namespaceTools;
+  if (request.previous_response_id) {
+    const resumed = responsesSessions.resume(request.previous_response_id, openAIRequest);
+    openAIRequest = resumed.request;
+    customToolNames = new Set([...resumed.customToolNames, ...customToolNames]);
+    namespaceTools = new Map([...resumed.namespaceTools, ...namespaceTools]);
+  }
+  openAIRequest = prepareOpenAIRequestForCatpaw(openAIRequest, {
+    maxSystemChars: config.maxSystemChars,
+    workspaceContext,
+  });
+  const responseId = createResponseId();
+  await handleNormalizedRequest(
+    res,
+    config,
+    limits,
+    agentSessions,
+    metrics,
+    credentialProvider,
+    openAIRequest,
+    workspaceContext,
+    'responses',
+    {
+      responseId,
+      customToolNames,
+      namespaceTools,
+      onOpenAIResponse: (response) => responsesSessions.record(
+        responseId,
+        openAIRequest,
+        response,
+        customToolNames,
+        namespaceTools,
+      ),
+    },
+  );
+}
+
+async function handleNormalizedRequest(
+  res,
+  config,
+  limits,
+  agentSessions,
+  metrics,
+  credentialProvider,
+  openAIRequest,
+  workspaceContext,
+  outputFormat,
+  outputOptions = {},
+) {
   const clientWantsStream = openAIRequest.stream;
   const useNativeAgent = config.nativeAgent;
   const agentSession = useNativeAgent ? agentSessions.get(openAIRequest) : null;
@@ -192,6 +415,7 @@ async function handleMessages(
     systemChars: openAIRequest.messages?.find((message) => message.role === 'system')?.content?.length || 0,
     toolCount: openAIRequest.tools?.length || 0,
     protocol: useNativeAgent ? 'catpaw-agent' : 'openai',
+    outputFormat,
     workspaceMappingCount: workspaceContext?.mappings?.length || 0,
   });
   const controller = new AbortController();
@@ -225,20 +449,61 @@ async function handleMessages(
   }
 
   if (clientWantsStream) {
-    await relayStreamingResponse(
-      res,
-      upstreamResponse,
-      config,
-      limits,
-      agentSession,
-      agentSessions,
-      metrics,
-    );
+    if (outputFormat === 'responses') {
+      await relayResponsesStreamingResponse(
+        res,
+        upstreamResponse,
+        config,
+        limits,
+        agentSession,
+        agentSessions,
+        metrics,
+        outputOptions,
+      );
+    } else if (outputFormat === 'openai') {
+      await relayOpenAIStreamingResponse(
+        res,
+        upstreamResponse,
+        config,
+        limits,
+        agentSession,
+        agentSessions,
+        metrics,
+      );
+    } else {
+      await relayStreamingResponse(
+        res,
+        upstreamResponse,
+        config,
+        limits,
+        agentSession,
+        agentSessions,
+        metrics,
+      );
+    }
     return;
   }
 
   const contentType = upstreamResponse.headers.get('content-type') || '';
   if (contentType.includes('text/event-stream')) {
+    if (outputFormat === 'openai' || outputFormat === 'responses') {
+      const response = await collectOpenAIStreamingResponse(
+        upstreamResponse,
+        config,
+        limits,
+        agentSession,
+        agentSessions,
+        metrics,
+      );
+      await outputOptions.onOpenAIResponse?.(response);
+      sendJson(res, 200, outputFormat === 'responses'
+        ? openAIResponseToResponses(response, {
+            ...outputOptions,
+            model: config.model,
+          })
+        : response);
+      return;
+    }
     const message = await collectStreamingMessage(
       upstreamResponse,
       config.model,
@@ -255,7 +520,15 @@ async function handleMessages(
   const upstreamBody = decryptUpstreamBody(rawUpstreamBody, upstreamResponse);
   await writeDebugUpstream(config, upstreamResponse, upstreamBody);
   const openAIResponse = normalizeOpenAIResponse(JSON.parse(upstreamBody));
-  sendJson(res, 200, openAIToAnthropicMessage(openAIResponse, config.model));
+  await outputOptions.onOpenAIResponse?.(openAIResponse);
+  sendJson(res, 200, outputFormat === 'responses'
+    ? openAIResponseToResponses(openAIResponse, {
+        ...outputOptions,
+        model: config.model,
+      })
+    : outputFormat === 'openai'
+      ? openAIResponse
+      : openAIToAnthropicMessage(openAIResponse, config.model));
 }
 
 export function createCredentialProvider(config) {
@@ -263,6 +536,16 @@ export function createCredentialProvider(config) {
     return new CredentialBroker({
       pipeName: config.credentialPipe,
       nonce: config.credentialNonce,
+    });
+  }
+
+  if (config.headlessSessionPath && config.headlessSessionKeyPath) {
+    return new HeadlessCredentialProvider({
+      client: new CatpawAuthClient({ tenant: config.tenant }),
+      store: new EncryptedSessionStore({
+        sessionPath: config.headlessSessionPath,
+        keyPath: config.headlessSessionKeyPath,
+      }),
     });
   }
 
@@ -408,6 +691,213 @@ function decryptUpstreamBody(body, upstreamResponse) {
   }
 
   return decryptCatpawResponseBody(body, encryptedKey);
+}
+
+async function relayResponsesStreamingResponse(
+  res,
+  upstreamResponse,
+  config,
+  limits,
+  agentSession,
+  agentSessions,
+  metrics,
+  options,
+) {
+  await writeDebugRecord(config, {
+    type: 'upstream_response',
+    status: upstreamResponse.status,
+    contentType: upstreamResponse.headers.get('content-type') || '',
+    encrypted: Boolean(upstreamResponse.headers.get('encrypted-key')),
+    outputFormat: 'responses',
+  });
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  });
+
+  const contentType = upstreamResponse.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    const rawBody = await upstreamResponse.text();
+    const openAIResponse = normalizeOpenAIResponse(
+      JSON.parse(decryptUpstreamBody(rawBody, upstreamResponse)),
+    );
+    const response = openAIResponseToResponses(openAIResponse, {
+      ...options,
+      model: config.model,
+    });
+    await options.onOpenAIResponse?.(openAIResponse);
+    writeResponsesEvent(res, { type: 'response.created', response, sequence_number: 0 });
+    writeResponsesEvent(res, { type: 'response.completed', response, sequence_number: 1 });
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
+  }
+
+  const accumulator = new OpenAIStreamAccumulator(config.model, {
+    collapseSnapshots: Boolean(agentSession),
+    maxBufferChars: limits.maxStreamBufferChars,
+  });
+  const builder = new ResponsesStreamBuilder(config.model, options);
+  for await (const parsed of readUpstreamSseChunks(upstreamResponse, limits)) {
+    metrics.captureQuota(parsed);
+    await writeDebugStreamChunk(config, parsed);
+    const normalized = normalizeStreamChunk(parsed, agentSession, agentSessions);
+    const openAIChunk = accumulator.ingest(normalized);
+    for (const event of builder.ingest(openAIChunk)) {
+      writeResponsesEvent(res, event);
+    }
+  }
+
+  if (!accumulator.finishReason) {
+    const finishReason = accumulator.toolCalls.size > 0 ? 'tool_calls' : 'stop';
+    const finalChunk = accumulator.ingest({
+      id: accumulator.id,
+      choices: [{ delta: {}, finish_reason: finishReason }],
+    });
+    for (const event of builder.ingest(finalChunk)) {
+      writeResponsesEvent(res, event);
+    }
+  }
+  for (const event of builder.finish()) {
+    writeResponsesEvent(res, event);
+  }
+  await options.onOpenAIResponse?.(accumulator.response());
+  await metrics.captureUsage(accumulator);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function writeResponsesEvent(res, event) {
+  res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+}
+
+async function relayOpenAIStreamingResponse(
+  res,
+  upstreamResponse,
+  config,
+  limits,
+  agentSession,
+  agentSessions,
+  metrics,
+) {
+  await writeDebugRecord(config, {
+    type: 'upstream_response',
+    status: upstreamResponse.status,
+    contentType: upstreamResponse.headers.get('content-type') || '',
+    encrypted: Boolean(upstreamResponse.headers.get('encrypted-key')),
+    outputFormat: 'openai',
+  });
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  });
+
+  const accumulator = new OpenAIStreamAccumulator(config.model, {
+    collapseSnapshots: Boolean(agentSession),
+    maxBufferChars: limits.maxStreamBufferChars,
+  });
+  const contentType = upstreamResponse.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    const rawBody = await upstreamResponse.text();
+    const openAIResponse = normalizeOpenAIResponse(
+      JSON.parse(decryptUpstreamBody(rawBody, upstreamResponse)),
+    );
+    writeOpenAIResponseAsStream(res, openAIResponse, config.model);
+    res.end();
+    return;
+  }
+
+  for await (const parsed of readUpstreamSseChunks(upstreamResponse, limits)) {
+    metrics.captureQuota(parsed);
+    await writeDebugStreamChunk(config, parsed);
+    const chunk = accumulator.ingest(normalizeStreamChunk(parsed, agentSession, agentSessions));
+    if (shouldWriteOpenAIChunk(chunk)) {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    }
+  }
+
+  if (!accumulator.finishReason) {
+    const finishReason = accumulator.toolCalls.size > 0 ? 'tool_calls' : 'stop';
+    const finalChunk = accumulator.ingest({
+      id: accumulator.id,
+      choices: [{ delta: {}, finish_reason: finishReason }],
+    });
+    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+  }
+  await metrics.captureUsage(accumulator);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function collectOpenAIStreamingResponse(
+  upstreamResponse,
+  config,
+  limits,
+  agentSession,
+  agentSessions,
+  metrics,
+) {
+  const accumulator = new OpenAIStreamAccumulator(config.model, {
+    collapseSnapshots: Boolean(agentSession),
+    maxBufferChars: limits.maxStreamBufferChars,
+  });
+  for await (const parsed of readUpstreamSseChunks(upstreamResponse, limits)) {
+    metrics.captureQuota(parsed);
+    await writeDebugStreamChunk(config, parsed);
+    accumulator.ingest(normalizeStreamChunk(parsed, agentSession, agentSessions));
+  }
+  await metrics.captureUsage(accumulator);
+  return accumulator.response();
+}
+
+async function* readUpstreamSseChunks(upstreamResponse, limits) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for await (const chunk of upstreamResponse.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    enforceStreamBufferLimit(buffer, limits.maxStreamBufferChars);
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() || '';
+    for (const part of parts) {
+      yield* parseOpenAISseChunk(`${part}\n\n`);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    yield* parseOpenAISseChunk(`${buffer}\n\n`);
+  }
+}
+
+function shouldWriteOpenAIChunk(chunk) {
+  const choice = chunk.choices?.[0] || {};
+  return Object.keys(choice.delta || {}).length > 0
+    || Boolean(choice.finish_reason)
+    || Boolean(chunk.usage);
+}
+
+function writeOpenAIResponseAsStream(res, response, model) {
+  const choice = response.choices?.[0] || {};
+  const message = choice.message || {};
+  const chunk = {
+    id: response.id || `chatcmpl_${Date.now()}`,
+    object: 'chat.completion.chunk',
+    created: response.created || Math.floor(Date.now() / 1000),
+    model: response.model || model,
+    choices: [{
+      index: 0,
+      delta: {
+        role: 'assistant',
+        ...(message.content !== undefined ? { content: message.content } : {}),
+        ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
+      },
+      finish_reason: choice.finish_reason || 'stop',
+    }],
+    ...(response.usage ? { usage: response.usage } : {}),
+  };
+  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  res.write('data: [DONE]\n\n');
 }
 
 async function relayStreamingResponse(
@@ -740,6 +1230,25 @@ function isLoopback(host) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
+function isAuthorizedClient(req, apiKey) {
+  if (!apiKey) {
+    return true;
+  }
+  const authorization = String(req.headers.authorization || '');
+  const supplied = authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : '';
+  const expectedBytes = Buffer.from(apiKey);
+  const suppliedBytes = Buffer.from(supplied);
+  try {
+    return expectedBytes.length === suppliedBytes.length
+      && timingSafeEqual(expectedBytes, suppliedBytes);
+  } finally {
+    expectedBytes.fill(0);
+    suppliedBytes.fill(0);
+  }
+}
+
 function createGatewayMetrics(
   config,
   limits,
@@ -751,8 +1260,15 @@ function createGatewayMetrics(
   const quotaUrl = config.upstreamBaseUrl
     ? `${config.upstreamBaseUrl.replace(/\/+$/, '')}/api/user/limit`
     : null;
+  const quotaResetUrl = config.upstreamBaseUrl
+    ? `${config.upstreamBaseUrl.replace(/\/+$/, '')}/api/user/addQuota`
+    : null;
+  const quotaResetThreshold = 4;
+  const quotaResetCooldownMs = 15 * 60 * 1000;
   let quotaLastFetchedAt = 0;
   let quotaRequest = null;
+  let quotaResetRequest = null;
+  let quotaResetLastAttemptAt = 0;
   const state = {
     active: 0,
     successful: 0,
@@ -760,12 +1276,86 @@ function createGatewayMetrics(
     inputTokens: null,
     outputTokens: null,
     quota: { remaining: null, used: null, total: null },
+    quotaAutoReset: {
+      enabled: Boolean(config.autoResetQuota),
+      threshold: quotaResetThreshold,
+      lastAttemptAt: null,
+      lastSuccessAt: null,
+      lastError: null,
+    },
     activity: [],
   };
 
   const addActivity = (type, status) => {
     state.activity.unshift({ at: new Date().toISOString(), type, status });
     state.activity.length = Math.min(state.activity.length, limits.maxRecentActivity);
+  };
+
+  const applyQuota = (payload) => {
+    const quota = extractQuotaSnapshot(payload);
+    for (const key of ['remaining', 'used', 'total']) {
+      if (quota[key] !== null) {
+        state.quota[key] = quota[key];
+      }
+    }
+    return quota;
+  };
+
+  const maybeAutoResetQuota = async (credential) => {
+    if (!config.autoResetQuota
+      || !quotaResetUrl
+      || state.quota.remaining === null
+      || state.quota.remaining >= quotaResetThreshold) {
+      return;
+    }
+    if (quotaResetRequest) {
+      await quotaResetRequest;
+      return;
+    }
+    if (Date.now() - quotaResetLastAttemptAt < quotaResetCooldownMs) {
+      return;
+    }
+
+    quotaResetRequest = (async () => {
+      quotaResetLastAttemptAt = Date.now();
+      state.quotaAutoReset.lastAttemptAt = new Date(quotaResetLastAttemptAt).toISOString();
+      state.quotaAutoReset.lastError = null;
+      try {
+        const headers = buildUpstreamHeaders(
+          { ...config, forceStream: false },
+          credential,
+        );
+        headers.Accept = 'application/json';
+        headers['Content-Type'] = 'application/json';
+        const response = await fetch(quotaResetUrl, {
+          method: 'POST',
+          headers,
+          body: '{}',
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const rawBody = await response.text();
+        const body = decryptUpstreamBody(rawBody, response);
+        const payload = JSON.parse(body);
+        if (payload?.code !== undefined && ![0, 200].includes(payload.code)) {
+          throw new Error(`API ${payload.code}`);
+        }
+        const quota = applyQuota(payload);
+        if (quota.total === null || quota.total <= 0) {
+          throw new Error('invalid quota response');
+        }
+        state.quotaAutoReset.lastSuccessAt = new Date().toISOString();
+        addActivity('quota_auto_reset', 200);
+      } catch (error) {
+        state.quotaAutoReset.lastError = error.message;
+        addActivity('quota_auto_reset_failed', 502);
+      } finally {
+        quotaResetRequest = null;
+      }
+    })();
+    await quotaResetRequest;
   };
 
   return {
@@ -780,12 +1370,14 @@ function createGatewayMetrics(
     async captureUsage(builder) {
       const usage = {};
       if (builder.hasInputUsage) {
-        state.inputTokens = (state.inputTokens || 0) + builder.usage.input_tokens;
-        usage.inputTokens = builder.usage.input_tokens;
+        const inputTokens = builder.usage.input_tokens ?? builder.usage.prompt_tokens;
+        state.inputTokens = (state.inputTokens || 0) + inputTokens;
+        usage.inputTokens = inputTokens;
       }
       if (builder.hasOutputUsage) {
-        state.outputTokens = (state.outputTokens || 0) + builder.usage.output_tokens;
-        usage.outputTokens = builder.usage.output_tokens;
+        const outputTokens = builder.usage.output_tokens ?? builder.usage.completion_tokens;
+        state.outputTokens = (state.outputTokens || 0) + outputTokens;
+        usage.outputTokens = outputTokens;
       }
       if (Object.keys(usage).length > 0) {
         await usageStore.record(usage);
@@ -830,12 +1422,8 @@ function createGatewayMetrics(
           }
           const rawBody = await response.text();
           const body = decryptUpstreamBody(rawBody, response);
-          const quota = extractQuotaSnapshot(JSON.parse(body));
-          for (const key of ['remaining', 'used', 'total']) {
-            if (quota[key] !== null) {
-              state.quota[key] = quota[key];
-            }
-          }
+          applyQuota(JSON.parse(body));
+          await maybeAutoResetQuota(credential);
         } catch {
           // Status polling remains available when Catpaw's quota endpoint is temporarily unavailable.
         } finally {
@@ -843,6 +1431,15 @@ function createGatewayMetrics(
         }
       })();
       await quotaRequest;
+    },
+    quotaSnapshot() {
+      const used = state.quota.used
+        ?? (state.quota.total !== null && state.quota.remaining !== null
+          ? Math.max(0, state.quota.total - state.quota.remaining)
+          : 0);
+      const total = state.quota.total
+        ?? (state.quota.remaining !== null ? used + state.quota.remaining : 0);
+      return { used, total };
     },
     snapshot(usage, range) {
       const memory = process.memoryUsage();
@@ -866,6 +1463,7 @@ function createGatewayMetrics(
         },
         usage: { ...usage, start: range.start, end: range.end },
         quota: state.quota,
+        quotaAutoReset: state.quotaAutoReset,
         recentActivity: state.activity,
       };
     },

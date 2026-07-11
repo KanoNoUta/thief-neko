@@ -13,6 +13,7 @@ internal static class CatpawAuthClientTests
     public static IEnumerable<(string Name, Func<Task> Run)> All()
     {
         yield return ("Catpaw auth creates QR challenge with public metadata", CreateQrAsync);
+        yield return ("Catpaw auth decrypts live protocol response format", DecryptProtocolResponseAsync);
         yield return ("Catpaw auth polls QR challenge with exact request", PollQrAsync);
         yield return ("Catpaw auth sends SMS with exact request", SendSmsAsync);
         yield return ("Catpaw auth verifies SMS with exact request", VerifySmsAsync);
@@ -47,7 +48,7 @@ internal static class CatpawAuthClientTests
         using var fixture = Fixture(async request =>
         {
             await AssertRequestAsync(request, HttpMethod.Get, "/api/login/qrcode", null, false);
-            return JsonResponse("""{"code":0,"data":{"code":"qr-result","qrcodeUrl":"https://example.invalid/qr","expiresAt":"2026-07-11T09:00:00Z"}}""");
+            return JsonResponse("""{"code":0,"data":{"code":"qr-result","qrCodeImageUrl":"https://example.invalid/qr","expireTime":1783760400000}}""");
         });
 
         var result = await fixture.Client.CreateQrAsync(default);
@@ -56,6 +57,18 @@ internal static class CatpawAuthClientTests
         AssertEqual("https://example.invalid/qr", result.QrCodeUrl, "QR URL should be parsed");
         AssertEqual(DateTimeOffset.Parse("2026-07-11T09:00:00Z"), result.ExpiresAt,
             "QR expiry should be parsed");
+    }
+
+    private static Task DecryptProtocolResponseAsync()
+    {
+        const string encryptedKey = "Af/QmmfjVa8nCIcOQ487QyoTU1q+UScLDCWBRIQEoleTJqZsyqzzAfjqo/DKM7AUjjZzgCZcBcV9vKF95tyK6E1qqABQLlASqwrKORmekCZnuE+iBQJzQPm40/mz9DAO3JYCHz0Hb+6QAemcXIOAWFLVpNijQrPI2kywO71JXaM7ic8PULBPCSb2P+R9qegs9rw/muT7z4CtITLAAKnUB3xhMz/UrkLkPe2VvTnlfVx/qZXvw9cPBeF8n33XHtGDSV3J5vvA5QkKivK7wbRXI0sdw/Lu2zjjJXm5V+0Htp2l85HLwF3BVjtX0S7k+xZ/YPKh8iXXezxpzK+Y5aJfwg==";
+        const string encryptedBody = "\"BlDvwjbM12mV/egbcOQhDuJohF/HY0nQBMga4Nx2os4P+rJE4+hyoSs6zf1uim3+xSNt2uDlxX7T3FsXU9vlPw==\"";
+
+        var clear = CatpawProtocolCrypto.DecryptResponse(encryptedBody, encryptedKey);
+        using var document = JsonDocument.Parse(clear);
+        AssertEqual(1000, document.RootElement.GetProperty("code").GetInt32(),
+            "encrypted Catpaw response should decrypt before parsing");
+        return Task.CompletedTask;
     }
 
     private static async Task PollQrAsync()
@@ -174,7 +187,7 @@ internal static class CatpawAuthClientTests
         {
             await AssertRequestAsync(request, HttpMethod.Get, "/api/login/userInfo", null, true,
                 "access-request-secret");
-            return JsonResponse("""{"code":0,"data":{"userId":"user-result","accountLabel":"Catpaw User"}}""");
+            return JsonResponse("""{"code":0,"data":{"uid":"user-result","loginName":"Catpaw User"}}""");
         });
 
         var result = await fixture.Client.GetUserInfoAsync("access-request-secret", default);

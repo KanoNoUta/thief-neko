@@ -165,6 +165,28 @@ test('loadConfig enables runtime Token refresh only when requested', () => {
   assert.equal(enabled.autoRefreshToken, true);
 });
 
+test('loadConfig enables low-quota automatic reset by default', () => {
+  assert.equal(loadConfig({ CATPAW_BASE_URL: 'https://catpaw.example' }).autoResetQuota, true);
+  assert.equal(loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.example',
+    CATPAW_AUTO_RESET_QUOTA: 'false',
+  }).autoResetQuota, false);
+});
+
+test('loadConfig requires an inbound API key outside loopback', () => {
+  assert.throws(() => loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.example',
+    HOST: '0.0.0.0',
+  }), /CATAPI_API_KEY is required/);
+
+  const config = loadConfig({
+    CATPAW_BASE_URL: 'https://catpaw.example',
+    HOST: '0.0.0.0',
+    CATAPI_API_KEY: 'new-api-channel-secret',
+  });
+  assert.equal(config.inboundApiKey, 'new-api-channel-secret');
+});
+
 test('loadConfig reads the credential broker pipe and nonce only as a pair', () => {
   const config = loadConfig({
     CATPAW_BASE_URL: 'https://catpaw.meituan.com',

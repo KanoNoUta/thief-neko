@@ -11,6 +11,11 @@ export function loadConfig(env = process.env) {
   const upstreamUrl = normalizeUpstreamUrl(env.CATPAW_UPSTREAM_URL, upstreamBaseUrl);
   const listenPort = parsePort(env.PORT);
   const credentialBroker = parseCredentialBroker(env);
+  const listenHost = env.HOST || '127.0.0.1';
+  const inboundApiKey = String(env.CATAPI_API_KEY || '').trim();
+  if (!isLoopbackHost(listenHost) && !inboundApiKey) {
+    throw new Error('CATAPI_API_KEY is required when HOST is not a loopback address');
+  }
 
   return {
     upstreamBaseUrl,
@@ -22,8 +27,9 @@ export function loadConfig(env = process.env) {
     maxSystemChars: DEFAULT_MAX_SYSTEM_CHARS,
     maxToolDescriptionChars: DEFAULT_MAX_TOOL_DESCRIPTION_CHARS,
     resourceLimits: loadResourceLimits(env),
-    listenHost: env.HOST || '127.0.0.1',
+    listenHost,
     listenPort,
+    inboundApiKey,
     debug: env.CATPAW_DEBUG === '1' || env.CATPAW_DEBUG === 'true',
     encrypt: env.CATPAW_ENCRYPT === '1' || env.CATPAW_ENCRYPT === 'true',
     forceStream: env.CATPAW_FORCE_STREAM === '1'
@@ -34,12 +40,20 @@ export function loadConfig(env = process.env) {
       upstreamUrl.includes('/api/gpt/openai/stream'),
     ),
     autoRefreshToken: parseBoolean(env.CATPAW_AUTO_REFRESH_TOKEN, false),
+    autoResetQuota: parseBoolean(env.CATPAW_AUTO_RESET_QUOTA, true),
     credentialPipe: credentialBroker.pipe,
     credentialNonce: credentialBroker.nonce,
+    headlessSessionPath: String(env.CATPAW_SESSION_PATH || '').trim(),
+    headlessSessionKeyPath: String(env.CATPAW_SESSION_KEY_PATH || '').trim(),
+    tenant: String(env.CATPAW_TENANT || '').trim(),
     userModelTypeCode: parseModelType(env.CATPAW_MODEL_TYPE),
     claudeSessionRoot: resolveClaudeSessionRoot(env),
     usageStorePath: resolveUsageStorePath(env),
   };
+}
+
+function isLoopbackHost(host) {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
 function parseCredentialBroker(env) {

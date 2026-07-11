@@ -4,7 +4,20 @@ import {
   anthropicToOpenAIRequest,
   normalizeOpenAIResponse,
   openAIToAnthropicMessage,
+  prepareOpenAIRequestForCatpaw,
 } from '../src/converters.js';
+
+test('prepareOpenAIRequestForCatpaw injects tool protocol guidance for OpenAI clients', () => {
+  const result = prepareOpenAIRequestForCatpaw({
+    model: 'glm-5.2',
+    messages: [{ role: 'user', content: 'Inspect files' }],
+    tools: [{ type: 'function', function: { name: 'TaskList', parameters: { type: 'object' } } }],
+  }, { maxSystemChars: 1000 });
+
+  assert.equal(result.messages[0].role, 'system');
+  assert.match(result.messages[0].content, /using tool_calls/);
+  assert.equal(result.messages[1].content, 'Inspect files');
+});
 
 test('anthropicToOpenAIRequest maps system, text messages, model, and max_tokens', () => {
   const result = anthropicToOpenAIRequest({
