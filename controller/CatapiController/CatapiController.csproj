@@ -5,7 +5,7 @@
     <AssemblyName>ThiefNeko</AssemblyName>
     <Product>Thief Neko</Product>
     <Description>Local Catpaw gateway controller for Claude Code Desktop</Description>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
