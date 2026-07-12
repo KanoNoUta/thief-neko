@@ -10,7 +10,7 @@ const HOSTED_TOOL_TYPES = new Set([
   'web_search',
   'web_search_preview',
 ]);
-const DEFAULT_MAX_HISTORY_CHARS = 192 * 1024;
+const DEFAULT_MAX_HISTORY_CHARS = 64 * 1024;
 const COMPACTION_NOTICE = '[Gateway context compaction] Earlier tool-loop messages were removed. '
   + 'Use the current workspace state and recent tool results as the source of truth.';
 
@@ -97,7 +97,7 @@ export function responsesMalformedToolResultCount(request) {
     if (
       message?.role === 'tool'
       && typeof message.content === 'string'
-      && /failed to parse function arguments:\s*missing field/i.test(message.content)
+      && /failed to parse function arguments:/i.test(message.content)
     ) {
       count += 1;
       continue;
@@ -228,7 +228,7 @@ export class ResponsesSessionStore {
     if (originalChars > this.maxSessionChars) {
       return false;
     }
-    const retainedMessages = compactResponseHistory(messages, this.maxHistoryChars);
+    const retainedMessages = compactResponsesHistory(messages, this.maxHistoryChars);
     const retainedChars = JSON.stringify(retainedMessages).length;
     while (this.sessions.size > 0 && this.totalChars + retainedChars > this.maxTotalChars) {
       this.delete(this.sessions.keys().next().value);
@@ -295,7 +295,7 @@ export class ResponsesSessionStore {
   }
 }
 
-function compactResponseHistory(messages, maxChars) {
+export function compactResponsesHistory(messages, maxChars = DEFAULT_MAX_HISTORY_CHARS) {
   if (JSON.stringify(messages).length <= maxChars) {
     return messages;
   }

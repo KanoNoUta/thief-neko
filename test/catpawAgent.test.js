@@ -293,6 +293,16 @@ test('normalizeCatpawAgentChunk removes leaked think tags from text', () => {
   assert.equal(normalized.choices[0].delta.content, 'plancontinuedetails');
 });
 
+test('normalizeCatpawAgentChunk collapses near-duplicate model paragraphs', () => {
+  const paragraph = '好的，继续工作。之前的问题是 PowerShell 引号损坏了 C# 文件。让我先检查当前文件状态，然后改用安全方式写入。';
+  const variant = '好的，继续工作！之前的问题是 PowerShell ""引号""损坏了 C# 文件，让我先检查当前文件状态，然后改用安全方式写入。';
+  const normalized = normalizeCatpawAgentChunk({
+    content: paragraph + variant,
+    lastOne: true,
+  });
+  assert.equal(normalized.choices[0].delta.content, paragraph);
+});
+
 test('CatpawAgentSessionStore keeps conversation and mappings when access is refreshed', () => {
   let now = 0;
   const store = new CatpawAgentSessionStore({ now: () => now });

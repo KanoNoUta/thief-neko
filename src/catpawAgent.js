@@ -351,9 +351,36 @@ function normalizeArguments(value) {
 }
 
 function sanitizeModelText(value) {
-  return value
+  return deduplicateModelText(value
     .replace(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/gi, '')
-    .replace(/<\/?(?:think|tool_call)\b[^>]*>/gi, '');
+    .replace(/<\/?(?:think|tool_call)\b[^>]*>/gi, ''));
+}
+
+function deduplicateModelText(value) {
+  let result = value;
+  while (result.length >= 80) {
+    const marker = result.slice(0, Math.min(4, result.length));
+    let boundary = result.indexOf(marker, Math.floor(result.length * 0.35));
+    let duplicateBoundary = -1;
+    while (boundary >= 0 && boundary <= result.length * 0.65) {
+      const left = normalizeDuplicateText(result.slice(0, boundary));
+      const right = normalizeDuplicateText(result.slice(boundary));
+      if (left.length >= 24 && left === right) {
+        duplicateBoundary = boundary;
+        break;
+      }
+      boundary = result.indexOf(marker, boundary + marker.length);
+    }
+    if (duplicateBoundary < 0) {
+      break;
+    }
+    result = result.slice(0, duplicateBoundary);
+  }
+  return result;
+}
+
+function normalizeDuplicateText(value) {
+  return value.toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
 }
 
 function sessionKey(openAIRequest) {

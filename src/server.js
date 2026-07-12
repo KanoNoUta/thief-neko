@@ -37,6 +37,7 @@ import { OpenAIStreamAccumulator, normalizeOpenAIRequest } from './openai.js';
 import {
   ResponsesStreamBuilder,
   ResponsesSessionStore,
+  compactResponsesHistory,
   createResponseId,
   openAIResponseToResponses,
   responsesKnownAgentIds,
@@ -376,16 +377,20 @@ async function handleResponses(
     const failedResult = [...openAIRequest.messages].reverse().find((message) => (
       message?.role === 'tool'
       && typeof message.content === 'string'
-      && /failed to parse function arguments:\s*missing field/i.test(message.content)
+      && /failed to parse function arguments:/i.test(message.content)
     ));
     failedResult.content += ' Retry once with every required tool argument populated. '
       + 'Do not repeat the same empty call.';
   }
+  knownAgentIds = new Set([...knownAgentIds, ...responsesKnownAgentIds(openAIRequest)]);
+  openAIRequest = {
+    ...openAIRequest,
+    messages: compactResponsesHistory(openAIRequest.messages),
+  };
   openAIRequest = prepareOpenAIRequestForCatpaw(openAIRequest, {
     maxSystemChars: config.maxSystemChars,
     workspaceContext,
   });
-  knownAgentIds = new Set([...knownAgentIds, ...responsesKnownAgentIds(openAIRequest)]);
   await handleNormalizedRequest(
     res,
     config,

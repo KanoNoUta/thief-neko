@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ResponsesStreamBuilder,
   ResponsesSessionStore,
+  compactResponsesHistory,
   openAIResponseToResponses,
   responsesKnownAgentIds,
   responsesMalformedToolResultCount,
@@ -418,6 +419,33 @@ test('ResponsesSessionStore compacts long histories without splitting tool call 
   assert.ok(resumed.some((item) => item.content?.startsWith?.('result 7')));
 });
 
+test('compactResponsesHistory limits a large first request before it reaches upstream', () => {
+  const messages = [
+    { role: 'system', content: 'Permanent instructions' },
+    { role: 'user', content: 'Initial task' },
+  ];
+  for (let index = 0; index < 20; index += 1) {
+    messages.push({ role: 'assistant', content: `old progress ${index} ${'x'.repeat(120)}` });
+  }
+  messages.push({
+    role: 'assistant',
+    content: null,
+    tool_calls: [{
+      id: 'call_latest',
+      type: 'function',
+      function: { name: 'shell_command', arguments: '{"command":"build"}' },
+    }],
+  });
+  messages.push({ role: 'tool', tool_call_id: 'call_latest', content: 'build failed' });
+
+  const compacted = compactResponsesHistory(messages, 700);
+  assert.ok(JSON.stringify(compacted).length <= 700);
+  assert.equal(compacted[0].content, 'Permanent instructions');
+  assert.equal(compacted[1].content, 'Initial task');
+  assert.ok(compacted.some((message) => message.tool_calls?.[0]?.id === 'call_latest'));
+  assert.ok(compacted.some((message) => message.tool_call_id === 'call_latest'));
+});
+
 test('ResponsesSessionStore retains known agent IDs outside compacted message history', () => {
   const store = new ResponsesSessionStore({
     maxSessionChars: 10_000,
@@ -463,6 +491,18 @@ test('responsesMalformedToolResultCount detects only the trailing invalid-call l
   assert.equal(responsesMalformedToolResultCount({ messages }), 2);
   messages.push({ role: 'user', content: 'Try something else' });
   assert.equal(responsesMalformedToolResultCount({ messages }), 0);
+});
+
+test('responsesMalformedToolResultCount includes malformed JSON argument errors', () => {
+  const messages = [
+    { role: 'assistant', content: null, tool_calls: [{ id: 'one' }] },
+    {
+      role: 'tool',
+      tool_call_id: 'one',
+      content: 'failed to parse function arguments: EOF while parsing a string at line 1 column 118',
+    },
+  ];
+  assert.equal(responsesMalformedToolResultCount({ messages }), 1);
 });
 
 test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {
