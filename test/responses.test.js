@@ -4,6 +4,8 @@ import {
   ResponsesStreamBuilder,
   ResponsesSessionStore,
   openAIResponseToResponses,
+  responsesKnownAgentIds,
+  responsesMalformedToolResultCount,
   responsesToolMetadata,
   responsesToOpenAIRequest,
 } from '../src/responses.js';
@@ -170,6 +172,94 @@ test('ResponsesStreamBuilder restores namespace on streamed function calls', () 
   assert.equal(done.item.namespace, 'codex_app');
 });
 
+test('ResponsesStreamBuilder restores a unique namespace after the model shortens its alias', () => {
+  const metadata = responsesToolMetadata({
+    tools: [{
+      type: 'namespace',
+      name: 'multi_agent_v1',
+      tools: [{
+        type: 'function',
+        name: 'close_agent',
+        parameters: { type: 'object', properties: {} },
+      }],
+    }],
+  });
+  const stream = new ResponsesStreamBuilder('glm-5.2', {
+    responseId: 'resp_short_namespace',
+    namespaceTools: metadata.namespaceTools,
+  });
+  const events = [
+    ...stream.ingest({
+      choices: [{ delta: { tool_calls: [{
+        index: 0,
+        id: 'call_close',
+        type: 'function',
+        function: { name: 'close_agent', arguments: '{"target":"agent-id"}' },
+      }] }, finish_reason: 'tool_calls' }],
+    }),
+    ...stream.finish(),
+  ];
+  const done = events.find((event) => (
+    event.type === 'response.output_item.done'
+    && event.item.type === 'function_call'
+  ));
+  assert.equal(done.item.name, 'close_agent');
+  assert.equal(done.item.namespace, 'multi_agent_v1');
+});
+
+test('ResponsesStreamBuilder does not infer namespace for an ambiguous bare tool name', () => {
+  const metadata = responsesToolMetadata({
+    tools: [
+      { type: 'function', name: 'close_agent', parameters: { type: 'object' } },
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        tools: [{ type: 'function', name: 'close_agent', parameters: { type: 'object' } }],
+      },
+    ],
+  });
+  const response = openAIResponseToResponses({
+    choices: [{ message: { tool_calls: [{
+      id: 'call_plain',
+      type: 'function',
+      function: { name: 'close_agent', arguments: '{}' },
+    }] } }],
+  }, { namespaceTools: metadata.namespaceTools });
+  assert.equal(response.output[0].name, 'close_agent');
+  assert.equal(response.output[0].namespace, undefined);
+});
+
+test('ResponsesStreamBuilder repairs a uniquely shortened close_agent target from history', () => {
+  const metadata = responsesToolMetadata({
+    tools: [{
+      type: 'namespace',
+      name: 'multi_agent_v1',
+      tools: [{ type: 'function', name: 'close_agent', parameters: { type: 'object' } }],
+    }],
+  });
+  const request = { messages: [{
+    role: 'tool',
+    content: '{"agent_id":"019f52b8-6bd3-7622-9874-27f3b4522464","nickname":"Euclid"}',
+  }] };
+  const response = openAIResponseToResponses({
+    choices: [{ message: { tool_calls: [{
+      id: 'call_close',
+      type: 'function',
+      function: {
+        name: 'close_agent',
+        arguments: '{"target":"019f52b8-6bd3-762-9874-27f3b4522464"}',
+      },
+    }] } }],
+  }, {
+    namespaceTools: metadata.namespaceTools,
+    knownAgentIds: responsesKnownAgentIds(request),
+  });
+  assert.equal(response.output[0].namespace, 'multi_agent_v1');
+  assert.deepEqual(JSON.parse(response.output[0].arguments), {
+    target: '019f52b8-6bd3-7622-9874-27f3b4522464',
+  });
+});
+
 test('ResponsesStreamBuilder emits text and function call events in order', () => {
   const stream = new ResponsesStreamBuilder('glm-5.2', {
     responseId: 'resp_test',
@@ -283,6 +373,96 @@ test('ResponsesSessionStore resumes a tool loop from previous_response_id', () =
   assert.throws(() => store.resume('resp_missing', { messages: [] }), {
     message: /previous response was not found/,
   });
+});
+
+test('ResponsesSessionStore compacts long histories without splitting tool call groups', () => {
+  const store = new ResponsesSessionStore({
+    maxSessions: 2,
+    ttlMs: 60_000,
+    maxSessionChars: 10_000,
+    maxTotalChars: 20_000,
+    maxHistoryChars: 700,
+  });
+  const messages = [
+    { role: 'system', content: 'Permanent instructions' },
+    { role: 'user', content: 'Build the project' },
+  ];
+  for (let index = 0; index < 8; index += 1) {
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: `call_${index}`,
+        type: 'function',
+        function: { name: 'shell_command', arguments: `{"command":"step ${index}"}` },
+      }],
+    });
+    messages.push({
+      role: 'tool',
+      tool_call_id: `call_${index}`,
+      content: `result ${index} ${'x'.repeat(80)}`,
+    });
+  }
+  assert.equal(store.record('resp_compact', { messages }, {
+    choices: [{ message: { role: 'assistant', content: 'Continue' } }],
+  }), true);
+
+  const resumed = store.resume('resp_compact', { messages: [] }).request.messages;
+  assert.equal(resumed[0].content, 'Permanent instructions');
+  assert.equal(resumed[1].content, 'Build the project');
+  assert.match(resumed[2].content, /context compaction/);
+  assert.ok(JSON.stringify(resumed).length <= 700);
+  for (const message of resumed.filter((item) => item.role === 'tool')) {
+    assert.ok(resumed.some((item) => item.tool_calls?.some((call) => call.id === message.tool_call_id)));
+  }
+  assert.ok(resumed.some((item) => item.content?.startsWith?.('result 7')));
+});
+
+test('ResponsesSessionStore retains known agent IDs outside compacted message history', () => {
+  const store = new ResponsesSessionStore({
+    maxSessionChars: 10_000,
+    maxTotalChars: 20_000,
+    maxHistoryChars: 400,
+  });
+  const agentId = '019f52b8-6bd3-7622-9874-27f3b4522464';
+  const messages = [
+    { role: 'user', content: 'Long task' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'spawn',
+        type: 'function',
+        function: {
+          name: 'multi_agent_v1__spawn_agent',
+          arguments: `{"message":"${'old task '.repeat(60)}"}`,
+        },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'spawn', content: `{"agent_id":"${agentId}"}` },
+    { role: 'assistant', content: 'x'.repeat(600) },
+  ];
+  assert.equal(store.record('resp_agents', { messages }, {
+    choices: [{ message: { role: 'assistant', content: 'Continue' } }],
+  }), true);
+  const resumed = store.resume('resp_agents', { messages: [] });
+  assert.equal(resumed.request.messages.some((message) => message.content?.includes?.(agentId)), false);
+  assert.deepEqual(resumed.knownAgentIds, new Set([agentId]));
+});
+
+test('responsesMalformedToolResultCount detects only the trailing invalid-call loop', () => {
+  const failure = 'failed to parse function arguments: missing field `command` at line 1 column 2';
+  const messages = [
+    { role: 'tool', tool_call_id: 'old', content: failure },
+    { role: 'assistant', content: 'Recovered' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'one' }] },
+    { role: 'tool', tool_call_id: 'one', content: failure },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'two' }] },
+    { role: 'tool', tool_call_id: 'two', content: failure },
+  ];
+  assert.equal(responsesMalformedToolResultCount({ messages }), 2);
+  messages.push({ role: 'user', content: 'Try something else' });
+  assert.equal(responsesMalformedToolResultCount({ messages }), 0);
 });
 
 test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {

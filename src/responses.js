@@ -10,6 +10,9 @@ const HOSTED_TOOL_TYPES = new Set([
   'web_search',
   'web_search_preview',
 ]);
+const DEFAULT_MAX_HISTORY_CHARS = 192 * 1024;
+const COMPACTION_NOTICE = '[Gateway context compaction] Earlier tool-loop messages were removed. '
+  + 'Use the current workspace state and recent tool results as the source of truth.';
 
 export function responsesToOpenAIRequest(request, options = {}) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -70,11 +73,46 @@ export function responsesCustomToolNames(request) {
   return responsesToolMetadata(request).customToolNames;
 }
 
+export function responsesKnownAgentIds(request) {
+  const ids = new Set();
+  for (const message of request?.messages || []) {
+    if (message?.role !== 'tool' || typeof message.content !== 'string') {
+      continue;
+    }
+    for (const match of message.content.matchAll(/"agent_id"\s*:\s*"([0-9a-f-]{36})"/gi)) {
+      ids.add(match[1].toLowerCase());
+    }
+  }
+  return ids;
+}
+
+export function responsesMalformedToolResultCount(request) {
+  let count = 0;
+  const messages = request?.messages || [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      continue;
+    }
+    if (
+      message?.role === 'tool'
+      && typeof message.content === 'string'
+      && /failed to parse function arguments:\s*missing field/i.test(message.content)
+    ) {
+      count += 1;
+      continue;
+    }
+    break;
+  }
+  return count;
+}
+
 export function responsesToolMetadata(request) {
   const tools = Array.isArray(request?.tools) ? request.tools : [];
-  const usedNames = new Set(tools
+  const plainToolNames = new Set(tools
     .filter((tool) => tool?.type !== 'namespace' && tool?.name)
     .map((tool) => tool.name));
+  const usedNames = new Set(plainToolNames);
   const customToolNames = new Set();
   const namespaceTools = new Map();
   const openAITools = [];
@@ -111,11 +149,20 @@ export function responsesToolMetadata(request) {
         namespace: tool.name,
         name: child.name,
         type: child.type,
+        allowBareName: false,
       });
       if (child.type === 'custom') {
         customToolNames.add(alias);
       }
     }
+  }
+  const childNameCounts = new Map();
+  for (const descriptor of namespaceTools.values()) {
+    childNameCounts.set(descriptor.name, (childNameCounts.get(descriptor.name) || 0) + 1);
+  }
+  for (const descriptor of namespaceTools.values()) {
+    descriptor.allowBareName = !plainToolNames.has(descriptor.name)
+      && childNameCounts.get(descriptor.name) === 1;
   }
   return { openAITools, customToolNames, namespaceTools };
 }
@@ -130,6 +177,7 @@ export class ResponsesSessionStore {
     ttlMs = 6 * 60 * 60 * 1000,
     maxSessionChars = 16 * 1024 * 1024,
     maxTotalChars = 64 * 1024 * 1024,
+    maxHistoryChars,
     now = Date.now,
   } = {}) {
     if (!Number.isSafeInteger(maxSessions) || maxSessions <= 0) {
@@ -144,6 +192,10 @@ export class ResponsesSessionStore {
     if (!Number.isSafeInteger(maxTotalChars) || maxTotalChars < maxSessionChars) {
       throw new RangeError('maxTotalChars must be a safe integer at least maxSessionChars');
     }
+    const historyLimit = maxHistoryChars ?? Math.min(DEFAULT_MAX_HISTORY_CHARS, maxSessionChars);
+    if (!Number.isSafeInteger(historyLimit) || historyLimit <= 0 || historyLimit > maxSessionChars) {
+      throw new RangeError('maxHistoryChars must be a positive safe integer at most maxSessionChars');
+    }
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function');
     }
@@ -151,6 +203,7 @@ export class ResponsesSessionStore {
     this.ttlMs = ttlMs;
     this.maxSessionChars = maxSessionChars;
     this.maxTotalChars = maxTotalChars;
+    this.maxHistoryChars = historyLimit;
     this.now = now;
     this.sessions = new Map();
     this.totalChars = 0;
@@ -162,25 +215,32 @@ export class ResponsesSessionStore {
     response,
     customToolNames = new Set(),
     namespaceTools = new Map(),
+    knownAgentIds = new Set(),
   ) {
     const assistant = response?.choices?.[0]?.message;
     const messages = structuredClone(request?.messages || []);
     if (assistant) {
       messages.push(structuredClone(assistant));
     }
-    const retainedChars = JSON.stringify(messages).length;
+    const originalChars = JSON.stringify(messages).length;
     this.sweep();
     this.delete(responseId);
-    if (retainedChars > this.maxSessionChars) {
+    if (originalChars > this.maxSessionChars) {
       return false;
     }
+    const retainedMessages = compactResponseHistory(messages, this.maxHistoryChars);
+    const retainedChars = JSON.stringify(retainedMessages).length;
     while (this.sessions.size > 0 && this.totalChars + retainedChars > this.maxTotalChars) {
       this.delete(this.sessions.keys().next().value);
     }
     this.sessions.set(responseId, {
-      messages,
+      messages: retainedMessages,
       customToolNames: new Set(customToolNames),
       namespaceTools: new Map(namespaceTools),
+      knownAgentIds: new Set([
+        ...knownAgentIds,
+        ...responsesKnownAgentIds({ messages }),
+      ]),
       lastAccessAt: this.now(),
       retainedChars,
     });
@@ -212,6 +272,7 @@ export class ResponsesSessionStore {
       },
       customToolNames: new Set(session.customToolNames),
       namespaceTools: new Map(session.namespaceTools || []),
+      knownAgentIds: new Set(session.knownAgentIds || []),
     };
   }
 
@@ -234,18 +295,82 @@ export class ResponsesSessionStore {
   }
 }
 
+function compactResponseHistory(messages, maxChars) {
+  if (JSON.stringify(messages).length <= maxChars) {
+    return messages;
+  }
+  const anchorIndexes = new Set();
+  let firstTaskIndex = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messages[index]?.role === 'system') {
+      anchorIndexes.add(index);
+    } else if (firstTaskIndex < 0 && messages[index]?.role === 'user') {
+      firstTaskIndex = index;
+      anchorIndexes.add(index);
+    }
+  }
+  const anchors = messages.filter((_, index) => anchorIndexes.has(index));
+  const notice = { role: 'system', content: COMPACTION_NOTICE };
+  const fixed = [...anchors, notice];
+  let retainedChars = JSON.stringify(fixed).length;
+  const units = historyUnits(messages, anchorIndexes);
+  const recent = [];
+  for (let index = units.length - 1; index >= 0; index -= 1) {
+    const unitChars = JSON.stringify(units[index]).length;
+    if (retainedChars + unitChars > maxChars) {
+      continue;
+    }
+    recent.unshift(...units[index]);
+    retainedChars += unitChars;
+  }
+  return [...anchors, notice, ...recent];
+}
+
+function historyUnits(messages, excludedIndexes) {
+  const units = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    if (excludedIndexes.has(index)) {
+      continue;
+    }
+    const message = messages[index];
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+      const callIds = new Set(message.tool_calls.map((call) => call?.id).filter(Boolean));
+      const unit = [message];
+      while (
+        index + 1 < messages.length
+        && messages[index + 1]?.role === 'tool'
+        && callIds.has(messages[index + 1]?.tool_call_id)
+      ) {
+        index += 1;
+        unit.push(messages[index]);
+      }
+      units.push(unit);
+    } else {
+      units.push([message]);
+    }
+  }
+  return units;
+}
+
 export function openAIResponseToResponses(openAIResponse, options = {}) {
   const choice = openAIResponse?.choices?.[0] || {};
   const message = choice.message || {};
   const responseId = options.responseId || responsesId();
   const customToolNames = options.customToolNames || new Set();
   const namespaceTools = options.namespaceTools || new Map();
+  const knownAgentIds = options.knownAgentIds || new Set();
   const output = [];
   if (message.content) {
     output.push(messageOutput(responseId, String(message.content), 'completed'));
   }
   for (const toolCall of message.tool_calls || []) {
-    output.push(toolOutput(toolCall, customToolNames, namespaceTools, 'completed'));
+    output.push(toolOutput(
+      toolCall,
+      customToolNames,
+      namespaceTools,
+      'completed',
+      knownAgentIds,
+    ));
   }
   return responseObject({
     id: responseId,
@@ -263,6 +388,7 @@ export class ResponsesStreamBuilder {
     this.responseId = options.responseId || responsesId();
     this.customToolNames = options.customToolNames || new Set();
     this.namespaceTools = options.namespaceTools || new Map();
+    this.knownAgentIds = options.knownAgentIds || new Set();
     this.createdAt = Math.floor(Date.now() / 1000);
     this.sequence = 0;
     this.started = false;
@@ -320,7 +446,13 @@ export class ResponsesStreamBuilder {
       output[this.textOutputIndex] = item;
     }
     for (const [, tool] of [...this.tools.entries()].sort(([left], [right]) => left - right)) {
-      const item = completedToolOutput(tool, this.customToolNames, this.namespaceTools);
+      const item = completedToolOutput(
+        tool,
+        this.customToolNames,
+        this.namespaceTools,
+        'completed',
+        this.knownAgentIds,
+      );
       const custom = item.type === 'custom_tool_call';
       const value = custom ? item.input : item.arguments;
       events.push(this.event(
@@ -566,18 +698,18 @@ function messageOutput(responseId, text, status) {
   };
 }
 
-function toolOutput(toolCall, customToolNames, namespaceTools, status) {
+function toolOutput(toolCall, customToolNames, namespaceTools, status, knownAgentIds = new Set()) {
   const tool = {
     id: toolCall.id,
     name: toolCall.function?.name || '',
     arguments: argumentString(toolCall.function?.arguments),
   };
-  return completedToolOutput(tool, customToolNames, namespaceTools, status);
+  return completedToolOutput(tool, customToolNames, namespaceTools, status, knownAgentIds);
 }
 
 function pendingToolOutput(tool, customToolNames, namespaceTools = new Map()) {
   const custom = customToolNames.has(tool.name);
-  const descriptor = namespaceTools.get(tool.name);
+  const descriptor = namespaceToolDescriptor(namespaceTools, tool.name);
   const wireName = descriptor?.name || tool.name;
   const namespace = descriptor?.namespace;
   return custom
@@ -601,17 +733,61 @@ function pendingToolOutput(tool, customToolNames, namespaceTools = new Map()) {
       };
 }
 
+function namespaceToolDescriptor(namespaceTools, name) {
+  const exact = namespaceTools.get(name);
+  if (exact) {
+    return exact;
+  }
+  for (const descriptor of namespaceTools.values()) {
+    if (descriptor.allowBareName && descriptor.name === name) {
+      return descriptor;
+    }
+  }
+  return undefined;
+}
+
 function completedToolOutput(
   tool,
   customToolNames,
   namespaceTools = new Map(),
   status = 'completed',
+  knownAgentIds = new Set(),
 ) {
   const pending = pendingToolOutput(tool, customToolNames, namespaceTools);
   if (pending.type === 'custom_tool_call') {
     return { ...pending, status, input: customInput(tool.arguments) };
   }
-  return { ...pending, status, arguments: tool.arguments };
+  return {
+    ...pending,
+    status,
+    arguments: repairAgentTarget(pending, tool.arguments, knownAgentIds),
+  };
+}
+
+function repairAgentTarget(tool, argumentText, knownAgentIds) {
+  if (tool.namespace !== 'multi_agent_v1' || tool.name !== 'close_agent') {
+    return argumentText;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(argumentText);
+  } catch {
+    return argumentText;
+  }
+  if (typeof parsed?.target !== 'string' || knownAgentIds.has(parsed.target.toLowerCase())) {
+    return argumentText;
+  }
+  const shortened = parsed.target.toLowerCase();
+  const matches = [...knownAgentIds].filter((candidate) => (
+    candidate.length === shortened.length + 1
+    && [...candidate].some((_, index) => (
+      candidate.slice(0, index) + candidate.slice(index + 1) === shortened
+    ))
+  ));
+  if (matches.length !== 1) {
+    return argumentText;
+  }
+  return JSON.stringify({ ...parsed, target: matches[0] });
 }
 
 function namespacedToolAlias(namespace, name, usedNames) {

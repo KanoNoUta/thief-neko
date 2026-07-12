@@ -157,6 +157,79 @@ test('gateway relays an OpenAI Responses custom tool loop', async (t) => {
   );
 });
 
+test('gateway stops a repeated malformed Responses tool loop without another upstream call', async (t) => {
+  const upstreamRequests = [];
+  const upstream = http.createServer(async (req, res) => {
+    upstreamRequests.push(await readJson(req));
+    const index = upstreamRequests.length;
+    const chunk = {
+      id: `chatcmpl-malformed-${index}`,
+      toolCalls: [{
+        id: `call_shell_${index}`,
+        type: 'function',
+        function: { name: 'shell_command', arguments: '{}' },
+      }],
+      choices: [{ finishReason: 'tool_calls' }],
+      lastOne: true,
+      statusCode: 0,
+    };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify(chunk)}\n\n`);
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createTestGateway(upstream, null);
+  await listen(gateway);
+  t.after(() => gateway.close());
+  const url = `http://127.0.0.1:${gateway.address().port}/v1/responses`;
+  const tools = [{
+    type: 'function',
+    name: 'shell_command',
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+    },
+  }];
+  const failure = 'failed to parse function arguments: missing field `command` at line 1 column 2';
+
+  const first = await postJson(url, {
+    model: 'codex-model',
+    stream: true,
+    input: 'Run the build',
+    tools,
+  });
+  const firstResponseId = first.match(/"id":"(resp_[^"]+)"/)?.[1];
+  assert.ok(firstResponseId);
+
+  const second = await postJson(url, {
+    model: 'codex-model',
+    stream: true,
+    previous_response_id: firstResponseId,
+    input: [{ type: 'function_call_output', call_id: 'call_shell_1', output: failure }],
+    tools,
+  });
+  const secondResponseId = second.match(/"id":"(resp_[^"]+)"/)?.[1];
+  assert.ok(secondResponseId);
+  assert.equal(upstreamRequests.length, 2);
+  assert.match(
+    upstreamRequests[1].messages.find((message) => message.role === 'tool').content,
+    /Do not repeat the same empty call/,
+  );
+
+  const third = await postJson(url, {
+    model: 'codex-model',
+    stream: true,
+    previous_response_id: secondResponseId,
+    input: [{ type: 'function_call_output', call_id: 'call_shell_2', output: failure }],
+    tools,
+  });
+  assert.match(third, /stopped a repeated invalid tool-call loop/);
+  assert.match(third, /data: \[DONE\]/);
+  assert.equal(upstreamRequests.length, 2);
+});
+
 test('gateway relays Codex namespace tools and ignores hosted web search', async (t) => {
   const upstream = http.createServer(async (req, res) => {
     await readJson(req);

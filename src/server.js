@@ -39,6 +39,8 @@ import {
   ResponsesSessionStore,
   createResponseId,
   openAIResponseToResponses,
+  responsesKnownAgentIds,
+  responsesMalformedToolResultCount,
   responsesToolMetadata,
   responsesToOpenAIRequest,
 } from './responses.js';
@@ -344,17 +346,46 @@ async function handleResponses(
   });
   let customToolNames = toolMetadata.customToolNames;
   let namespaceTools = toolMetadata.namespaceTools;
+  let knownAgentIds = new Set();
   if (request.previous_response_id) {
     const resumed = responsesSessions.resume(request.previous_response_id, openAIRequest);
     openAIRequest = resumed.request;
     customToolNames = new Set([...resumed.customToolNames, ...customToolNames]);
     namespaceTools = new Map([...resumed.namespaceTools, ...namespaceTools]);
+    knownAgentIds = resumed.knownAgentIds;
+  }
+  const malformedToolResults = responsesMalformedToolResultCount(openAIRequest);
+  const responseId = createResponseId();
+  if (malformedToolResults >= 2) {
+    await sendLocalResponsesText(
+      res,
+      config,
+      request.stream,
+      responseId,
+      'The gateway stopped a repeated invalid tool-call loop before another upstream request. '
+        + 'Continue the task to retry from the current workspace state.',
+      responsesSessions,
+      openAIRequest,
+      customToolNames,
+      namespaceTools,
+      knownAgentIds,
+    );
+    return;
+  }
+  if (malformedToolResults === 1) {
+    const failedResult = [...openAIRequest.messages].reverse().find((message) => (
+      message?.role === 'tool'
+      && typeof message.content === 'string'
+      && /failed to parse function arguments:\s*missing field/i.test(message.content)
+    ));
+    failedResult.content += ' Retry once with every required tool argument populated. '
+      + 'Do not repeat the same empty call.';
   }
   openAIRequest = prepareOpenAIRequestForCatpaw(openAIRequest, {
     maxSystemChars: config.maxSystemChars,
     workspaceContext,
   });
-  const responseId = createResponseId();
+  knownAgentIds = new Set([...knownAgentIds, ...responsesKnownAgentIds(openAIRequest)]);
   await handleNormalizedRequest(
     res,
     config,
@@ -369,15 +400,69 @@ async function handleResponses(
       responseId,
       customToolNames,
       namespaceTools,
+      knownAgentIds,
       onOpenAIResponse: (response) => responsesSessions.record(
         responseId,
         openAIRequest,
         response,
         customToolNames,
         namespaceTools,
+        knownAgentIds,
       ),
     },
   );
+}
+
+async function sendLocalResponsesText(
+  res,
+  config,
+  stream,
+  responseId,
+  text,
+  responsesSessions,
+  openAIRequest,
+  customToolNames,
+  namespaceTools,
+  knownAgentIds,
+) {
+  const openAIResponse = {
+    model: config.model,
+    choices: [{
+      finish_reason: 'stop',
+      message: { role: 'assistant', content: text },
+    }],
+  };
+  responsesSessions.record(
+    responseId,
+    openAIRequest,
+    openAIResponse,
+    customToolNames,
+    namespaceTools,
+    knownAgentIds,
+  );
+  if (!stream) {
+    sendJson(res, 200, openAIResponseToResponses(openAIResponse, {
+      responseId,
+      model: config.model,
+    }));
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  });
+  const builder = new ResponsesStreamBuilder(config.model, { responseId });
+  for (const event of builder.ingest({
+    choices: [{ delta: { content: text }, finish_reason: 'stop' }],
+  })) {
+    writeResponsesEvent(res, event);
+  }
+  for (const event of builder.finish()) {
+    writeResponsesEvent(res, event);
+  }
+  res.write('data: [DONE]\n\n');
+  res.end();
 }
 
 async function handleNormalizedRequest(

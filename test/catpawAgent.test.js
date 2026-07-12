@@ -264,6 +264,35 @@ test('CatpawAgentSessionStore keeps one conversation and records tool suggest UU
   assert.equal(first.suggestUuidByToolCallId.get('call_1'), 'suggest-1');
 });
 
+test('CatpawAgentSessionStore rotates long-running upstream conversations', () => {
+  const store = new CatpawAgentSessionStore({ maxRequestsPerConversation: 2 });
+  const request = sessionRequest('long-task');
+  const first = store.get(request);
+  const firstConversationId = first.conversationId;
+  store.record(first, {
+    suggestUuid: 'suggest-old',
+    toolCalls: [{ id: 'call-old' }],
+  });
+
+  const second = store.get(request);
+  assert.equal(second.conversationId, firstConversationId);
+  assert.equal(second.requestCount, 2);
+
+  const third = store.get(request);
+  assert.notEqual(third.conversationId, firstConversationId);
+  assert.equal(third.requestCount, 1);
+  assert.equal(third.rotationCount, 1);
+  assert.equal(third.suggestUuidByToolCallId.size, 0);
+});
+
+test('normalizeCatpawAgentChunk removes leaked think tags from text', () => {
+  const normalized = normalizeCatpawAgentChunk({
+    content: 'plan</think>continue<think>details<tool_call>shell_command</tool_call>',
+    lastOne: true,
+  });
+  assert.equal(normalized.choices[0].delta.content, 'plancontinuedetails');
+});
+
 test('CatpawAgentSessionStore keeps conversation and mappings when access is refreshed', () => {
   let now = 0;
   const store = new CatpawAgentSessionStore({ now: () => now });

@@ -65,7 +65,9 @@ export function normalizeCatpawAgentChunk(chunk, workspaceContext) {
     && delta.content === undefined
     && !hasNativeDelta
   ) {
-    delta.content = chunk.content;
+    delta.content = sanitizeModelText(chunk.content);
+  } else if (typeof delta.content === 'string') {
+    delta.content = sanitizeModelText(delta.content);
   }
 
   if (Array.isArray(chunk.toolCalls)) {
@@ -139,11 +141,13 @@ export class CatpawAgentSessionStore {
     maxSessions = 128,
     ttlMs = 21_600_000,
     maxSuggestMappings = 256,
+    maxRequestsPerConversation = 64,
     now = monotonicNow,
   } = {}) {
     validatePositiveSafeInteger('maxSessions', maxSessions);
     validatePositiveSafeInteger('ttlMs', ttlMs);
     validatePositiveSafeInteger('maxSuggestMappings', maxSuggestMappings);
+    validatePositiveSafeInteger('maxRequestsPerConversation', maxRequestsPerConversation);
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function');
     }
@@ -151,6 +155,7 @@ export class CatpawAgentSessionStore {
     this.maxSessions = maxSessions;
     this.ttlMs = ttlMs;
     this.maxSuggestMappings = maxSuggestMappings;
+    this.maxRequestsPerConversation = maxRequestsPerConversation;
     this.now = now;
     this.sessions = new Map();
   }
@@ -165,6 +170,12 @@ export class CatpawAgentSessionStore {
     const key = sessionKey(openAIRequest);
     let session = this.sessions.get(key);
     if (session) {
+      if (session.requestCount >= this.maxRequestsPerConversation) {
+        session.conversationId = randomUUID();
+        session.suggestUuidByToolCallId.clear();
+        session.requestCount = 0;
+        session.rotationCount += 1;
+      }
       session.lastAccessAt = now;
       this.sessions.delete(key);
       this.sessions.set(key, session);
@@ -173,6 +184,8 @@ export class CatpawAgentSessionStore {
         conversationId: randomUUID(),
         suggestUuidByToolCallId: new Map(),
         lastAccessAt: now,
+        requestCount: 0,
+        rotationCount: 0,
       };
       this.sessions.set(key, session);
     }
@@ -181,6 +194,7 @@ export class CatpawAgentSessionStore {
       this.sessions.delete(this.sessions.keys().next().value);
     }
 
+    session.requestCount += 1;
     return session;
   }
 
@@ -334,6 +348,12 @@ function normalizeArguments(value) {
     return value;
   }
   return JSON.stringify(value || {});
+}
+
+function sanitizeModelText(value) {
+  return value
+    .replace(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/gi, '')
+    .replace(/<\/?(?:think|tool_call)\b[^>]*>/gi, '');
 }
 
 function sessionKey(openAIRequest) {
