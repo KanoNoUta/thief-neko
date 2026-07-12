@@ -64,6 +64,39 @@ test('buildCatpawAgentRequest wraps Claude tools in the native Catpaw MCP tool c
   }]);
 });
 
+test('buildCatpawAgentRequest flattens structured message content without object placeholders', () => {
+  const result = buildCatpawAgentRequest({
+    messages: [
+      {
+        role: 'system',
+        content: [
+          { type: 'text', text: 'Follow the instructions.' },
+          { type: 'image', source: { type: 'base64', data: 'ignored' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'First line.' },
+          { type: 'input_text', text: 'Second line.' },
+          { content: [{ type: 'text', text: 'Nested line.' }] },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: { result: 'ok' } },
+    ],
+    tools: [],
+  }, { conversationId: 'conversation-structured' });
+
+  assert.equal(result.agentModeConfig.systemPrompt, 'Follow the instructions.');
+  assert.equal(result.messages[0].content, 'First line.\nSecond line.\nNested line.');
+  assert.deepEqual(result.messages[0].multiModalContent, [{
+    type: 'text',
+    text: 'First line.\nSecond line.\nNested line.',
+  }]);
+  assert.equal(result.messages[1].content, '{"result":"ok"}');
+  assert.doesNotMatch(JSON.stringify(result), /\[object Object\]/);
+});
+
 test('buildCatpawAgentRequest maps tool calls and results with their Catpaw suggestUuid', () => {
   const suggestUuidByToolCallId = new Map([['call_1', 'suggest-1']]);
   const result = buildCatpawAgentRequest({

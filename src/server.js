@@ -41,8 +41,10 @@ import {
   createResponseId,
   openAIResponseToResponses,
   recoverMalformedResponsesToolLoop,
+  recoverResponsesReadOnlyToolLoop,
   responsesKnownAgentIds,
   responsesMalformedToolResultCount,
+  responsesReadOnlyToolLoopState,
   responsesToolMetadata,
   responsesToOpenAIRequest,
 } from './responses.js';
@@ -402,6 +404,26 @@ async function handleResponses(
     ));
     failedResult.content += ' Retry once with every required tool argument populated. '
       + 'Do not repeat the same empty call.';
+  }
+  const readLoop = responsesReadOnlyToolLoopState(openAIRequest);
+  if (readLoop.recoveryActive && readLoop.rounds >= 3) {
+    await sendLocalResponsesText(
+      res,
+      config,
+      request.stream,
+      responseId,
+      'The gateway stopped a stalled read-only tool loop after one automatic recovery attempt. '
+        + 'Continue from the current workspace state with a concrete implementation instruction.',
+      responsesSessions,
+      openAIRequest,
+      customToolNames,
+      namespaceTools,
+      knownAgentIds,
+    );
+    return;
+  }
+  if (!readLoop.recoveryActive && readLoop.rounds >= 10) {
+    openAIRequest = recoverResponsesReadOnlyToolLoop(openAIRequest);
   }
   knownAgentIds = new Set([...knownAgentIds, ...responsesKnownAgentIds(openAIRequest)]);
   openAIRequest = {

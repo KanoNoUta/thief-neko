@@ -265,7 +265,7 @@ function validatePositiveSafeInteger(name, value) {
 function buildAgentModeConfig(openAIRequest, userModelTypeCode) {
   const systemPrompt = (openAIRequest.messages || [])
     .filter((message) => message.role === 'system')
-    .map((message) => String(message.content || ''))
+    .map((message) => messageContentText(message.content))
     .join('\n\n');
 
   return {
@@ -303,7 +303,7 @@ function buildAgentModeConfig(openAIRequest, userModelTypeCode) {
 }
 
 function toCatpawMessage(message, toolNames, suggestUuidByToolCallId = new Map()) {
-  const content = String(message.content || '');
+  const content = messageContentText(message.content);
   const mapped = {
     content,
     multiModalContent: [{ type: 'text', text: content }],
@@ -329,6 +329,38 @@ function toCatpawMessage(message, toolNames, suggestUuidByToolCallId = new Map()
   }
 
   return mapped;
+}
+
+function messageContentText(content) {
+  if (content === undefined || content === null) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => messageContentText(block))
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+    if (Object.prototype.hasOwnProperty.call(content, 'content')) {
+      return messageContentText(content.content);
+    }
+    if (['image', 'image_url', 'input_image', 'document'].includes(content.type)) {
+      return '';
+    }
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return '';
+    }
+  }
+  return String(content);
 }
 
 function collectToolNames(messages) {

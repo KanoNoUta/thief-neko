@@ -16,6 +16,24 @@ const COMPACTION_NOTICE = '[Gateway context compaction] Earlier tool-loop messag
 const MALFORMED_TOOL_RECOVERY_NOTICE = '[Gateway malformed tool recovery] The previous invalid '
   + 'tool-call rounds were removed. Continue from the current workspace state. Call one tool at '
   + 'a time until normal execution resumes, and provide strict JSON with every required argument.';
+const READ_LOOP_RECOVERY_NOTICE = '[Gateway stalled read-loop recovery] Enough project context has '
+  + 'already been gathered. Stop repeating read, list, search, and inspection commands. Use the '
+  + 'current workspace state to make the requested changes now, or report one concrete blocker.';
+const READ_ONLY_TOOL_NAMES = new Set([
+  'codebase_search',
+  'find_files',
+  'get_file',
+  'glob',
+  'grep',
+  'list_dir',
+  'list_directory',
+  'read',
+  'read_file',
+  'read_text_file',
+  'read_thread_terminal',
+  'search',
+  'view_image',
+]);
 
 export function responsesToOpenAIRequest(request, options = {}) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -174,6 +192,86 @@ export function recoverMalformedResponsesToolLoop(request) {
       { role: 'system', content: MALFORMED_TOOL_RECOVERY_NOTICE },
     ],
   };
+}
+
+export function responsesReadOnlyToolLoopState(request) {
+  const messages = request?.messages || [];
+  let cursor = messages.length;
+  let rounds = 0;
+  let recoveryActive = false;
+  while (cursor > 0) {
+    let reachedRecoveryBoundary = false;
+    while (cursor > 0 && messages[cursor - 1]?.role === 'system') {
+      const system = messages[cursor - 1];
+      if (
+        typeof system.content === 'string'
+        && system.content.includes(READ_LOOP_RECOVERY_NOTICE)
+      ) {
+        recoveryActive = true;
+        reachedRecoveryBoundary = true;
+      }
+      cursor -= 1;
+    }
+    if (reachedRecoveryBoundary) {
+      break;
+    }
+    let toolResultCount = 0;
+    while (cursor > 0 && messages[cursor - 1]?.role === 'tool') {
+      toolResultCount += 1;
+      cursor -= 1;
+    }
+    const assistant = messages[cursor - 1];
+    if (
+      toolResultCount === 0
+      || assistant?.role !== 'assistant'
+      || !Array.isArray(assistant.tool_calls)
+      || assistant.tool_calls.length === 0
+      || !assistant.tool_calls.every(isReadOnlyToolCall)
+    ) {
+      break;
+    }
+    rounds += 1;
+    cursor -= 1;
+  }
+  return { rounds, recoveryActive };
+}
+
+export function recoverResponsesReadOnlyToolLoop(request) {
+  return {
+    ...request,
+    messages: [
+      ...structuredClone(request?.messages || []),
+      { role: 'system', content: READ_LOOP_RECOVERY_NOTICE },
+    ],
+  };
+}
+
+function isReadOnlyToolCall(toolCall) {
+  const rawName = toolCall?.function?.name;
+  if (typeof rawName !== 'string') {
+    return false;
+  }
+  const name = rawName.toLowerCase().split('__').pop();
+  if (READ_ONLY_TOOL_NAMES.has(name)) {
+    return true;
+  }
+  if (name !== 'shell_command') {
+    return false;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(toolCall.function.arguments || '{}');
+  } catch {
+    return false;
+  }
+  const command = typeof parsed.command === 'string' ? parsed.command.trim() : '';
+  if (
+    !command
+    || /(?:^|[\s;|&])(set-content|out-file|remove-item|move-item|copy-item|new-item|git\s+(?:add|commit|push)|npm\s+install|dotnet\s+(?:build|publish)|rm|mv|cp|mkdir)\b/i.test(command)
+  ) {
+    return false;
+  }
+  return /^(?:get-content|get-childitem|get-item|get-command|get-process|select-string|test-path|rg|git\s+(?:status|diff|log|show)|pwd|ls|dir|type|cat|head|tail|find|grep|wc)\b/i.test(command);
 }
 
 export function responsesToolMetadata(request) {

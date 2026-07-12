@@ -8,6 +8,8 @@ import {
   responsesKnownAgentIds,
   responsesMalformedToolResultCount,
   recoverMalformedResponsesToolLoop,
+  recoverResponsesReadOnlyToolLoop,
+  responsesReadOnlyToolLoopState,
   responsesToolMetadata,
   responsesToOpenAIRequest,
 } from '../src/responses.js';
@@ -551,6 +553,58 @@ test('recoverMalformedResponsesToolLoop removes a bad suffix and allows only one
     ],
   };
   assert.equal(recoverMalformedResponsesToolLoop(failedAgain), null);
+});
+
+test('responsesReadOnlyToolLoopState detects inspection rounds and resets after a write', () => {
+  const messages = [{ role: 'user', content: 'Implement the feature' }];
+  for (let index = 0; index < 10; index += 1) {
+    messages.push({
+      role: 'assistant',
+      tool_calls: [{
+        id: `read_${index}`,
+        function: {
+          name: 'functions__shell_command',
+          arguments: JSON.stringify({ command: `Get-Content src/file-${index}.js` }),
+        },
+      }],
+    });
+    messages.push({ role: 'tool', tool_call_id: `read_${index}`, content: 'source text' });
+  }
+  assert.deepEqual(responsesReadOnlyToolLoopState({ messages }), {
+    rounds: 10,
+    recoveryActive: false,
+  });
+
+  const recovered = recoverResponsesReadOnlyToolLoop({ messages });
+  recovered.messages.push({
+    role: 'assistant',
+    tool_calls: [{
+      id: 'read_after_recovery',
+      function: { name: 'functions__read_file', arguments: '{"path":"src/latest.js"}' },
+    }],
+  });
+  recovered.messages.push({
+    role: 'tool',
+    tool_call_id: 'read_after_recovery',
+    content: 'latest source',
+  });
+  assert.deepEqual(responsesReadOnlyToolLoopState(recovered), {
+    rounds: 1,
+    recoveryActive: true,
+  });
+
+  recovered.messages.push({
+    role: 'assistant',
+    tool_calls: [{
+      id: 'write_progress',
+      function: { name: 'functions__apply_patch', arguments: '{}' },
+    }],
+  });
+  recovered.messages.push({ role: 'tool', tool_call_id: 'write_progress', content: 'Done!' });
+  assert.deepEqual(responsesReadOnlyToolLoopState(recovered), {
+    rounds: 0,
+    recoveryActive: false,
+  });
 });
 
 test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {
