@@ -70,8 +70,13 @@ export function normalizeCatpawAgentChunk(chunk, workspaceContext) {
     delta.content = sanitizeModelText(delta.content);
   }
 
-  if (Array.isArray(chunk.toolCalls)) {
-    delta.tool_calls = chunk.toolCalls.map((toolCall, index) => {
+  const streamedToolCalls = firstToolCallArray(
+    chunk.toolCalls,
+    delta.tool_calls,
+    delta.toolCalls,
+  );
+  if (streamedToolCalls) {
+    delta.tool_calls = streamedToolCalls.map((toolCall, index) => {
       const normalizedToolCall = {
         ...toolCall,
         index,
@@ -80,12 +85,13 @@ export function normalizeCatpawAgentChunk(chunk, workspaceContext) {
               ...toolCall.function,
               arguments: toolCall.function.arguments == null
                 ? toolCall.function.arguments
-                : normalizeArguments(toolCall.function.arguments),
+                : normalizeArguments(toolCall.function.arguments, toolCall.function.name),
             }
           : toolCall.function,
       };
       return rewriteClaudeFileToolCall(normalizedToolCall, workspaceContext);
     });
+    delete delta.toolCalls;
   }
 
   const nativeFinishReason = existingChoice.finish_reason || existingChoice.finishReason;
@@ -100,6 +106,10 @@ export function normalizeCatpawAgentChunk(chunk, workspaceContext) {
       finish_reason: finishReason,
     }],
   };
+}
+
+function firstToolCallArray(...candidates) {
+  return candidates.find((candidate) => Array.isArray(candidate));
 }
 
 export function summarizeCatpawToolCalls(chunk) {
@@ -343,11 +353,42 @@ function firstSuggestUuid(toolCalls, suggestUuidByToolCallId) {
   return undefined;
 }
 
-function normalizeArguments(value) {
+function normalizeArguments(value, toolName) {
   if (typeof value === 'string') {
-    return value;
+    return repairShellCommandArguments(value, toolName);
   }
   return JSON.stringify(value || {});
+}
+
+function repairShellCommandArguments(value, toolName) {
+  if (!isShellCommandTool(toolName)) {
+    return value;
+  }
+  try {
+    JSON.parse(value);
+    return value;
+  } catch {
+    // A quoted Windows directory ending in backslash can consume the JSON string's closing quote.
+  }
+  const propertyPattern = /,\s*"(?:timeout_ms|workdir|justification|sandbox_permissions|prefix_rule|login)"\s*:/g;
+  const boundaries = [...value.matchAll(propertyPattern)].map((match) => match.index);
+  for (const boundary of boundaries.reverse()) {
+    const candidate = `${value.slice(0, boundary)}"${value.slice(boundary)}`;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed.command === 'string') {
+        return candidate;
+      }
+    } catch {
+      // Try the preceding property boundary.
+    }
+  }
+  return value;
+}
+
+function isShellCommandTool(toolName) {
+  return typeof toolName === 'string'
+    && (toolName === 'shell_command' || toolName.endsWith('__shell_command'));
 }
 
 function sanitizeModelText(value) {

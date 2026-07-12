@@ -505,6 +505,24 @@ test('responsesMalformedToolResultCount includes malformed JSON argument errors'
   assert.equal(responsesMalformedToolResultCount({ messages }), 1);
 });
 
+test('responsesMalformedToolResultCount treats parallel malformed calls as one failed round', () => {
+  const failure = 'failed to parse function arguments: EOF while parsing a string';
+  const messages = [
+    { role: 'user', content: 'Inspect the files' },
+    {
+      role: 'assistant',
+      tool_calls: [
+        { id: 'call_one', function: { name: 'functions__shell_command', arguments: '{}' } },
+        { id: 'call_two', function: { name: 'functions__shell_command', arguments: '{}' } },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'call_one', content: failure },
+    { role: 'tool', tool_call_id: 'call_two', content: failure },
+  ];
+
+  assert.equal(responsesMalformedToolResultCount({ messages }), 1);
+});
+
 test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {
   const store = new ResponsesSessionStore({
     maxSessions: 10,

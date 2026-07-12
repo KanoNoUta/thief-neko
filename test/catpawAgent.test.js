@@ -122,6 +122,70 @@ test('normalizeCatpawAgentChunk maps top-level content and toolCalls to OpenAI d
   assert.equal(result.choices[0].finish_reason, 'tool_calls');
 });
 
+test('normalizeCatpawAgentChunk repairs a shell command quote after a trailing Windows slash', () => {
+  const malformed = String.raw`{"command": "dir \"C:\\Users\\Administrator\\.codex\\attachments\\\", "timeout_ms": 500}`;
+  assert.throws(() => JSON.parse(malformed));
+
+  const result = normalizeCatpawAgentChunk({
+    toolCalls: [{
+      id: 'call_shell',
+      type: 'function',
+      function: { name: 'shell_command', arguments: malformed },
+    }],
+    lastOne: true,
+  });
+  const repaired = result.choices[0].delta.tool_calls[0].function.arguments;
+  assert.deepEqual(JSON.parse(repaired), {
+    command: 'dir "C:\\Users\\Administrator\\.codex\\attachments\\"',
+    timeout_ms: 500,
+  });
+});
+
+test('normalizeCatpawAgentChunk repairs a namespaced Codex shell command', () => {
+  const malformed = String.raw`{"command": "dir \"C:\\Users\\Administrator\\.codex\\attachments\\\", "timeout_ms": 500}`;
+  const result = normalizeCatpawAgentChunk({
+    toolCalls: [{
+      id: 'call_namespaced_shell',
+      type: 'function',
+      function: { name: 'functions__shell_command', arguments: malformed },
+    }],
+    lastOne: true,
+  });
+
+  assert.deepEqual(
+    JSON.parse(result.choices[0].delta.tool_calls[0].function.arguments),
+    {
+      command: 'dir "C:\\Users\\Administrator\\.codex\\attachments\\"',
+      timeout_ms: 500,
+    },
+  );
+});
+
+test('normalizeCatpawAgentChunk repairs namespaced shell arguments from OpenAI delta chunks', () => {
+  const malformed = String.raw`{"command": "dir \"C:\\Users\\Administrator\\.codex\\attachments\\\", "timeout_ms": 500}`;
+  const result = normalizeCatpawAgentChunk({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: 'call_delta_shell',
+          type: 'function',
+          function: { name: 'functions__shell_command', arguments: malformed },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  });
+
+  assert.deepEqual(
+    JSON.parse(result.choices[0].delta.tool_calls[0].function.arguments),
+    {
+      command: 'dir "C:\\Users\\Administrator\\.codex\\attachments\\"',
+      timeout_ms: 500,
+    },
+  );
+});
+
 test('normalizeCatpawAgentChunk does not resend retained text with a tool update', () => {
   const result = normalizeCatpawAgentChunk({
     id: 'chatcmpl-1',

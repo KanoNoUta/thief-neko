@@ -88,23 +88,29 @@ export function responsesKnownAgentIds(request) {
 
 export function responsesMalformedToolResultCount(request) {
   let count = 0;
+  let malformedInRound = false;
+  let toolResultInRound = false;
   const messages = request?.messages || [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      if (!toolResultInRound || !malformedInRound) {
+        break;
+      }
+      count += 1;
+      malformedInRound = false;
+      toolResultInRound = false;
       continue;
     }
-    if (
-      message?.role === 'tool'
-      && typeof message.content === 'string'
-      && /failed to parse function arguments:/i.test(message.content)
-    ) {
-      count += 1;
+    if (message?.role === 'tool') {
+      toolResultInRound = true;
+      malformedInRound ||= typeof message.content === 'string'
+        && /failed to parse function arguments:/i.test(message.content);
       continue;
     }
     break;
   }
-  return count;
+  return count + (malformedInRound ? 1 : 0);
 }
 
 export function responsesToolMetadata(request) {
