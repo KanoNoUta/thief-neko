@@ -157,7 +157,7 @@ test('gateway relays an OpenAI Responses custom tool loop', async (t) => {
   );
 });
 
-test('gateway stops a repeated malformed Responses tool loop without another upstream call', async (t) => {
+test('gateway rotates and retries one repeated malformed Responses tool loop', async (t) => {
   const upstreamRequests = [];
   const upstream = http.createServer(async (req, res) => {
     upstreamRequests.push(await readJson(req));
@@ -225,9 +225,24 @@ test('gateway stops a repeated malformed Responses tool loop without another ups
     input: [{ type: 'function_call_output', call_id: 'call_shell_2', output: failure }],
     tools,
   });
-  assert.match(third, /stopped a repeated invalid tool-call loop/);
-  assert.match(third, /data: \[DONE\]/);
-  assert.equal(upstreamRequests.length, 2);
+  const thirdResponseId = third.match(/"id":"(resp_[^"]+)"/)?.[1];
+  assert.ok(thirdResponseId);
+  assert.doesNotMatch(third, /stopped a repeated invalid tool-call loop/);
+  assert.equal(upstreamRequests.length, 3);
+  assert.notEqual(upstreamRequests[2].conversationId, upstreamRequests[1].conversationId);
+  assert.equal(upstreamRequests[2].messages.some((message) => message.role === 'tool'), false);
+  assert.match(upstreamRequests[2].agentModeConfig.systemPrompt, /Gateway malformed tool recovery/);
+
+  const fourth = await postJson(url, {
+    model: 'codex-model',
+    stream: true,
+    previous_response_id: thirdResponseId,
+    input: [{ type: 'function_call_output', call_id: 'call_shell_3', output: failure }],
+    tools,
+  });
+  assert.match(fourth, /stopped a repeated invalid tool-call loop after one automatic recovery/);
+  assert.match(fourth, /data: \[DONE\]/);
+  assert.equal(upstreamRequests.length, 3);
 });
 
 test('gateway relays Codex namespace tools and ignores hosted web search', async (t) => {

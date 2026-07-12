@@ -40,6 +40,7 @@ import {
   compactResponsesHistory,
   createResponseId,
   openAIResponseToResponses,
+  recoverMalformedResponsesToolLoop,
   responsesKnownAgentIds,
   responsesMalformedToolResultCount,
   responsesToolMetadata,
@@ -358,22 +359,42 @@ async function handleResponses(
   const malformedToolResults = responsesMalformedToolResultCount(openAIRequest);
   const responseId = createResponseId();
   if (malformedToolResults >= 2) {
-    await sendLocalResponsesText(
-      res,
-      config,
-      request.stream,
-      responseId,
-      'The gateway stopped a repeated invalid tool-call loop before another upstream request. '
-        + 'Continue the task to retry from the current workspace state.',
-      responsesSessions,
-      openAIRequest,
-      customToolNames,
-      namespaceTools,
-      knownAgentIds,
-    );
-    return;
+    const recoveredRequest = recoverMalformedResponsesToolLoop(openAIRequest);
+    if (!recoveredRequest) {
+      await sendLocalResponsesText(
+        res,
+        config,
+        request.stream,
+        responseId,
+        'The gateway stopped a repeated invalid tool-call loop after one automatic recovery attempt. '
+          + 'Continue the task to retry from the current workspace state.',
+        responsesSessions,
+        openAIRequest,
+        customToolNames,
+        namespaceTools,
+        knownAgentIds,
+      );
+      return;
+    }
+    openAIRequest = recoveredRequest;
   }
   if (malformedToolResults === 1) {
+    if (!recoverMalformedResponsesToolLoop(openAIRequest)) {
+      await sendLocalResponsesText(
+        res,
+        config,
+        request.stream,
+        responseId,
+        'The gateway stopped a repeated invalid tool-call loop after one automatic recovery attempt. '
+          + 'Continue the task to retry from the current workspace state.',
+        responsesSessions,
+        openAIRequest,
+        customToolNames,
+        namespaceTools,
+        knownAgentIds,
+      );
+      return;
+    }
     const failedResult = [...openAIRequest.messages].reverse().find((message) => (
       message?.role === 'tool'
       && typeof message.content === 'string'

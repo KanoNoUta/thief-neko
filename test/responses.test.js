@@ -7,6 +7,7 @@ import {
   openAIResponseToResponses,
   responsesKnownAgentIds,
   responsesMalformedToolResultCount,
+  recoverMalformedResponsesToolLoop,
   responsesToolMetadata,
   responsesToOpenAIRequest,
 } from '../src/responses.js';
@@ -521,6 +522,35 @@ test('responsesMalformedToolResultCount treats parallel malformed calls as one f
   ];
 
   assert.equal(responsesMalformedToolResultCount({ messages }), 1);
+});
+
+test('recoverMalformedResponsesToolLoop removes a bad suffix and allows only one immediate recovery', () => {
+  const request = {
+    model: 'test-model',
+    messages: [
+      { role: 'user', content: 'Finish the task' },
+      { role: 'assistant', tool_calls: [{ id: 'call_1' }] },
+      { role: 'tool', tool_call_id: 'call_1', content: 'failed to parse function arguments: EOF' },
+      { role: 'assistant', tool_calls: [{ id: 'call_2' }] },
+      { role: 'tool', tool_call_id: 'call_2', content: 'failed to parse function arguments: EOF' },
+    ],
+  };
+
+  const recovered = recoverMalformedResponsesToolLoop(request);
+  assert.equal(recovered.messages.length, 2);
+  assert.equal(recovered.messages[0].content, 'Finish the task');
+  assert.match(recovered.messages[1].content, /Gateway malformed tool recovery/);
+  assert.equal(request.messages.length, 5);
+
+  const failedAgain = {
+    ...recovered,
+    messages: [
+      ...recovered.messages,
+      { role: 'assistant', tool_calls: [{ id: 'call_3' }] },
+      { role: 'tool', tool_call_id: 'call_3', content: 'failed to parse function arguments: EOF' },
+    ],
+  };
+  assert.equal(recoverMalformedResponsesToolLoop(failedAgain), null);
 });
 
 test('ResponsesSessionStore evicts histories to stay within its memory budget', () => {

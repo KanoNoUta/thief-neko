@@ -13,6 +13,9 @@ const HOSTED_TOOL_TYPES = new Set([
 const DEFAULT_MAX_HISTORY_CHARS = 64 * 1024;
 const COMPACTION_NOTICE = '[Gateway context compaction] Earlier tool-loop messages were removed. '
   + 'Use the current workspace state and recent tool results as the source of truth.';
+const MALFORMED_TOOL_RECOVERY_NOTICE = '[Gateway malformed tool recovery] The previous invalid '
+  + 'tool-call rounds were removed. Continue from the current workspace state. Call one tool at '
+  + 'a time until normal execution resumes, and provide strict JSON with every required argument.';
 
 export function responsesToOpenAIRequest(request, options = {}) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -111,6 +114,66 @@ export function responsesMalformedToolResultCount(request) {
     break;
   }
   return count + (malformedInRound ? 1 : 0);
+}
+
+export function recoverMalformedResponsesToolLoop(request) {
+  const messages = request?.messages || [];
+  let cursor = messages.length;
+  let suffixStart = messages.length;
+  while (cursor > 0) {
+    let malformedInRound = false;
+    let toolResultInRound = false;
+    while (cursor > 0 && messages[cursor - 1]?.role === 'tool') {
+      const toolResult = messages[cursor - 1];
+      toolResultInRound = true;
+      malformedInRound ||= typeof toolResult.content === 'string'
+        && /failed to parse function arguments:/i.test(toolResult.content);
+      cursor -= 1;
+    }
+    const assistant = messages[cursor - 1];
+    if (
+      !toolResultInRound
+      || !malformedInRound
+      || assistant?.role !== 'assistant'
+      || !Array.isArray(assistant.tool_calls)
+    ) {
+      break;
+    }
+    cursor -= 1;
+    suffixStart = cursor;
+  }
+  if (suffixStart === messages.length) {
+    return null;
+  }
+  for (let index = suffixStart - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'user') {
+      break;
+    }
+    if (
+      message?.role === 'tool'
+      && !(
+        typeof message.content === 'string'
+        && /failed to parse function arguments:/i.test(message.content)
+      )
+    ) {
+      break;
+    }
+    if (
+      message?.role === 'system'
+      && typeof message.content === 'string'
+      && message.content.includes(MALFORMED_TOOL_RECOVERY_NOTICE)
+    ) {
+      return null;
+    }
+  }
+  return {
+    ...request,
+    messages: [
+      ...structuredClone(messages.slice(0, suffixStart)),
+      { role: 'system', content: MALFORMED_TOOL_RECOVERY_NOTICE },
+    ],
+  };
 }
 
 export function responsesToolMetadata(request) {
