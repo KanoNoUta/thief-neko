@@ -449,6 +449,34 @@ test('compactResponsesHistory limits a large first request before it reaches ups
   assert.ok(compacted.some((message) => message.tool_call_id === 'call_latest'));
 });
 
+test('compactResponsesHistory retains an oversized latest tool round by compacting its content', () => {
+  const messages = [
+    { role: 'system', content: 'Permanent instructions' },
+    { role: 'user', content: 'Implement the task' },
+    { role: 'assistant', content: 'Old progress that should be removed' },
+    { role: 'user', content: 'Old follow-up that should be removed' },
+    {
+      role: 'assistant',
+      tool_calls: [{
+        id: 'call_latest_large',
+        type: 'function',
+        function: { name: 'Agent', arguments: JSON.stringify({ prompt: 'x'.repeat(800) }) },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'call_latest_large', content: `head-${'y'.repeat(1200)}-tail` },
+  ];
+
+  const compacted = compactResponsesHistory(messages, 700);
+
+  assert.ok(JSON.stringify(compacted).length <= 700);
+  assert.ok(compacted.some((message) => message.tool_calls?.[0]?.id === 'call_latest_large'));
+  const result = compacted.find((message) => message.tool_call_id === 'call_latest_large');
+  assert.match(result.content, /history content compacted/);
+  assert.match(result.content, /^head-/);
+  assert.match(result.content, /-tail$/);
+  assert.equal(compacted.some((message) => message.content === 'Old progress that should be removed'), false);
+});
+
 test('ResponsesSessionStore retains known agent IDs outside compacted message history', () => {
   const store = new ResponsesSessionStore({
     maxSessionChars: 10_000,

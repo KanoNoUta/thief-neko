@@ -55,6 +55,7 @@ export function createGatewayServer(config, dependencies = {}) {
     agentSessionTtlMs: 6 * 60 * 60 * 1000,
     maxSuggestMappings: 256,
     maxRequestBytes: 10 * 1024 * 1024,
+    maxHistoryChars: 256 * 1024,
     maxStreamBufferChars: 4 * 1024 * 1024,
     upstreamTimeoutMs: 5 * 60 * 1000,
     maxRecentActivity: 100,
@@ -68,6 +69,7 @@ export function createGatewayServer(config, dependencies = {}) {
   const responsesSessions = new ResponsesSessionStore({
     maxSessions: limits.maxAgentSessions,
     ttlMs: limits.agentSessionTtlMs,
+    maxHistoryChars: limits.maxHistoryChars,
   });
   const usageStore = config.usageStore || new UsageStore(config.usageStorePath);
   const credentialProvider = dependencies.credentialProvider
@@ -273,12 +275,16 @@ async function handleMessages(
     headers: req.headers,
     metadata: anthropicRequest.metadata,
   });
-  const openAIRequest = anthropicToOpenAIRequest(anthropicRequest, {
+  const convertedRequest = anthropicToOpenAIRequest(anthropicRequest, {
     model: config.model,
     maxSystemChars: config.maxSystemChars,
     maxToolDescriptionChars: config.maxToolDescriptionChars,
     workspaceContext,
   });
+  const openAIRequest = {
+    ...convertedRequest,
+    messages: compactResponsesHistory(convertedRequest.messages, limits.maxHistoryChars),
+  };
   await handleNormalizedRequest(
     res,
     config,
@@ -428,7 +434,7 @@ async function handleResponses(
   knownAgentIds = new Set([...knownAgentIds, ...responsesKnownAgentIds(openAIRequest)]);
   openAIRequest = {
     ...openAIRequest,
-    messages: compactResponsesHistory(openAIRequest.messages),
+    messages: compactResponsesHistory(openAIRequest.messages, limits.maxHistoryChars),
   };
   openAIRequest = prepareOpenAIRequestForCatpaw(openAIRequest, {
     maxSystemChars: config.maxSystemChars,

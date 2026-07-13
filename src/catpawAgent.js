@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { rewriteClaudeFileToolCall } from './claudeWorkspace.js';
+import { repairTruncatedJsonArguments } from './converters.js';
 
 const DEFAULT_MODEL_TYPE = 2;
 const TRIGGER_MODE = 'AGENT';
@@ -387,7 +388,8 @@ function firstSuggestUuid(toolCalls, suggestUuidByToolCallId) {
 
 function normalizeArguments(value, toolName) {
   if (typeof value === 'string') {
-    return repairShellCommandArguments(value, toolName);
+    const repaired = repairTruncatedJsonArguments(value);
+    return repairTruncatedJsonArguments(repairShellCommandArguments(repaired, toolName));
   }
   return JSON.stringify(value || {});
 }
@@ -460,7 +462,8 @@ function sessionKey(openAIRequest) {
   const messages = openAIRequest.messages || [];
   const system = messages
     .filter((message) => message.role === 'system')
-    .map((message) => message.content || '')
+    .map((message) => messageContentText(message.content))
+    .filter((content) => !content.startsWith('[Gateway context compaction]'))
     .join('\n');
   const firstUser = messages.find((message) => message.role === 'user');
   return createHash('sha256')

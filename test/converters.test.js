@@ -4,8 +4,24 @@ import {
   anthropicToOpenAIRequest,
   normalizeOpenAIResponse,
   openAIToAnthropicMessage,
+  parseToolArguments,
   prepareOpenAIRequestForCatpaw,
 } from '../src/converters.js';
+
+test('parseToolArguments repairs only missing JSON container closers', () => {
+  assert.deepEqual(
+    parseToolArguments('{"path":"README.md","range":[1,2]'),
+    { path: 'README.md', range: [1, 2] },
+  );
+  assert.deepEqual(
+    parseToolArguments('{"path":"unfinished'),
+    { raw: '{"path":"unfinished' },
+  );
+  assert.deepEqual(
+    parseToolArguments('{"path":}'),
+    { raw: '{"path":}' },
+  );
+});
 
 test('prepareOpenAIRequestForCatpaw injects tool protocol guidance for OpenAI clients', () => {
   const result = prepareOpenAIRequestForCatpaw({

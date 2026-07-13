@@ -13,6 +13,7 @@ const HOSTED_TOOL_TYPES = new Set([
 const DEFAULT_MAX_HISTORY_CHARS = 64 * 1024;
 const COMPACTION_NOTICE = '[Gateway context compaction] Earlier tool-loop messages were removed. '
   + 'Use the current workspace state and recent tool results as the source of truth.';
+const COMPACTED_CONTENT_MARKER = '[... history content compacted ...]';
 const MALFORMED_TOOL_RECOVERY_NOTICE = '[Gateway malformed tool recovery] The previous invalid '
   + 'tool-call rounds were removed. Continue from the current workspace state. Call one tool at '
   + 'a time until normal execution resumes, and provide strict JSON with every required argument.';
@@ -478,19 +479,93 @@ export function compactResponsesHistory(messages, maxChars = DEFAULT_MAX_HISTORY
   }
   const anchors = messages.filter((_, index) => anchorIndexes.has(index));
   const notice = { role: 'system', content: COMPACTION_NOTICE };
-  const fixed = [...anchors, notice];
+  const noticeChars = JSON.stringify([notice]).length;
+  const anchorBudget = Math.max(0, Math.floor(maxChars / 2) - noticeChars);
+  const fixed = [
+    ...fitHistoryMessages(anchors, anchorBudget),
+    notice,
+  ];
   let retainedChars = JSON.stringify(fixed).length;
   const units = historyUnits(messages, anchorIndexes);
   const recent = [];
   for (let index = units.length - 1; index >= 0; index -= 1) {
     const unitChars = JSON.stringify(units[index]).length;
-    if (retainedChars + unitChars > maxChars) {
+    if (retainedChars + unitChars <= maxChars) {
+      recent.unshift(...units[index]);
+      retainedChars += unitChars;
       continue;
     }
-    recent.unshift(...units[index]);
-    retainedChars += unitChars;
+    if (recent.length === 0) {
+      const available = Math.max(0, maxChars - retainedChars);
+      const compactedUnit = fitHistoryMessages(units[index], available);
+      if (JSON.stringify(compactedUnit).length <= available) {
+        recent.unshift(...compactedUnit);
+      }
+    }
+    break;
   }
-  return [...anchors, notice, ...recent];
+  return [...fixed, ...recent];
+}
+
+function fitHistoryMessages(messages, maxChars) {
+  if (JSON.stringify(messages).length <= maxChars) {
+    return structuredClone(messages);
+  }
+
+  const lengths = [];
+  for (const message of messages) {
+    if (typeof message?.content === 'string') {
+      lengths.push(message.content.length);
+    }
+    for (const toolCall of message?.tool_calls || []) {
+      if (typeof toolCall?.function?.arguments === 'string') {
+        lengths.push(toolCall.function.arguments.length);
+      }
+    }
+  }
+  let low = 0;
+  let high = Math.max(0, ...lengths);
+  let best = historyMessagesWithTextCap(messages, 0);
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = historyMessagesWithTextCap(messages, middle);
+    if (JSON.stringify(candidate).length <= maxChars) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+
+function historyMessagesWithTextCap(messages, maxTextChars) {
+  const compacted = structuredClone(messages);
+  for (const message of compacted) {
+    if (typeof message?.content === 'string' && message.content.length > maxTextChars) {
+      message.content = compactHistoryText(message.content, maxTextChars);
+    }
+    for (const toolCall of message?.tool_calls || []) {
+      const args = toolCall?.function?.arguments;
+      if (typeof args === 'string' && args.length > maxTextChars) {
+        toolCall.function.arguments = '{"_compacted":true}';
+      }
+    }
+  }
+  return compacted;
+}
+
+function compactHistoryText(text, maxChars) {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  if (maxChars <= COMPACTED_CONTENT_MARKER.length) {
+    return COMPACTED_CONTENT_MARKER.slice(0, maxChars);
+  }
+  const available = maxChars - COMPACTED_CONTENT_MARKER.length;
+  const headChars = Math.ceil(available / 2);
+  const tailChars = available - headChars;
+  return `${text.slice(0, headChars)}${COMPACTED_CONTENT_MARKER}${text.slice(-tailChars)}`;
 }
 
 function historyUnits(messages, excludedIndexes) {

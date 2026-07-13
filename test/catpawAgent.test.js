@@ -155,6 +155,25 @@ test('normalizeCatpawAgentChunk maps top-level content and toolCalls to OpenAI d
   assert.equal(result.choices[0].finish_reason, 'tool_calls');
 });
 
+test('normalizeCatpawAgentChunk closes truncated tool argument containers', () => {
+  const result = normalizeCatpawAgentChunk({
+    toolCalls: [{
+      id: 'call_agent',
+      type: 'function',
+      function: {
+        name: 'Agent',
+        arguments: '{"description":"inspect","prompt":"read files","options":[1,2]',
+      },
+    }],
+    lastOne: true,
+  });
+
+  assert.deepEqual(
+    JSON.parse(result.choices[0].delta.tool_calls[0].function.arguments),
+    { description: 'inspect', prompt: 'read files', options: [1, 2] },
+  );
+});
+
 test('normalizeCatpawAgentChunk repairs a shell command quote after a trailing Windows slash', () => {
   const malformed = String.raw`{"command": "dir \"C:\\Users\\Administrator\\.codex\\attachments\\\", "timeout_ms": 500}`;
   assert.throws(() => JSON.parse(malformed));
@@ -359,6 +378,26 @@ test('CatpawAgentSessionStore keeps one conversation and records tool suggest UU
     toolCalls: [{ id: 'call_1' }],
   });
   assert.equal(first.suggestUuidByToolCallId.get('call_1'), 'suggest-1');
+});
+
+test('CatpawAgentSessionStore ignores gateway notices when identifying a conversation', () => {
+  const store = new CatpawAgentSessionStore();
+  const initial = store.get({
+    messages: [
+      { role: 'system', content: 'Permanent instructions' },
+      { role: 'user', content: 'Implement the task' },
+    ],
+  });
+  const compacted = store.get({
+    messages: [
+      { role: 'system', content: 'Permanent instructions' },
+      { role: 'user', content: 'Implement the task' },
+      { role: 'system', content: '[Gateway context compaction] Old messages removed.' },
+      { role: 'assistant', content: 'Continue' },
+    ],
+  });
+
+  assert.equal(compacted.conversationId, initial.conversationId);
 });
 
 test('CatpawAgentSessionStore rotates long-running upstream conversations', () => {

@@ -545,6 +545,76 @@ test('gateway uses Catpaw native Agent protocol for tool-free auxiliary requests
   );
 });
 
+test('gateway compacts oversized Anthropic message history before upstream', async (t) => {
+  let upstreamRequest;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamRequest = await readJson(req);
+    sendJson(res, {
+      id: 'chatcmpl-compacted',
+      choices: [{
+        message: { role: 'assistant', content: 'COMPACTED_OK' },
+        finish_reason: 'stop',
+      }],
+    });
+  });
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const gateway = createGatewayServer({
+    listenHost: '127.0.0.1',
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}`,
+    upstreamUrl: `http://127.0.0.1:${upstream.address().port}/v1/chat/completions`,
+    model: 'glm-5.2',
+    forceStream: false,
+    nativeAgent: false,
+    encrypt: false,
+    debug: false,
+    extraHeaders: {},
+    resourceLimits: { maxHistoryChars: 700 },
+  });
+  await listen(gateway);
+  t.after(() => gateway.close());
+
+  const messages = [{ role: 'user', content: 'Implement the original task.' }];
+  for (let index = 0; index < 12; index += 1) {
+    messages.push({ role: 'assistant', content: `Old progress ${index} ${'x'.repeat(120)}` });
+    messages.push({ role: 'user', content: `Old result ${index} ${'y'.repeat(120)}` });
+  }
+  messages.push({
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'call_latest',
+      name: 'Read',
+      input: { file_path: 'F:\\project\\README.md' },
+    }],
+  });
+  messages.push({
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 'call_latest', content: 'latest contents' }],
+  });
+
+  const response = await postJson(messageUrl(gateway), {
+    model: 'claude-fable-5',
+    stream: false,
+    system: 'Keep working from the current workspace.',
+    messages,
+  });
+
+  assert.match(response, /COMPACTED_OK/);
+  assert.ok(JSON.stringify(upstreamRequest.messages).length <= 700);
+  assert.equal(upstreamRequest.messages[0].role, 'system');
+  assert.equal(upstreamRequest.messages[1].content, 'Implement the original task.');
+  assert.ok(upstreamRequest.messages.some((message) => (
+    typeof message.content === 'string'
+    && message.content.includes('Gateway context compaction')
+  )));
+  const toolCall = upstreamRequest.messages.find((message) => message.tool_calls?.[0]?.id === 'call_latest');
+  const toolResult = upstreamRequest.messages.find((message) => message.tool_call_id === 'call_latest');
+  assert.ok(toolCall);
+  assert.equal(toolResult.content, 'latest contents');
+});
+
 test('credential provider selection prefers broker, then SQLite, then manual headers', () => {
   const broker = createCredentialProvider({
     credentialPipe: 'catapi-credential-pipe',

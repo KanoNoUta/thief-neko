@@ -99,6 +99,28 @@ test('openAIStreamChunksToAnthropicEvents buffers streamed tool calls', () => {
   assert.equal(events.at(-2).data.delta.stop_reason, 'tool_use');
 });
 
+test('openAIStreamChunksToAnthropicEvents repairs missing tool argument closers', () => {
+  const events = openAIStreamChunksToAnthropicEvents([{
+    id: 'chatcmpl-repair',
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: 'call_read',
+          function: { name: 'Read', arguments: '{"file_path":"F:\\\\project\\\\README.md"' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  }], 'glm-5.2');
+
+  const inputDelta = events.find((event) => event.data?.delta?.type === 'input_json_delta');
+  assert.deepEqual(JSON.parse(inputDelta.data.delta.partial_json), {
+    file_path: 'F:\\project\\README.md',
+  });
+  assert.doesNotMatch(inputDelta.data.delta.partial_json, /"raw"/);
+});
+
 test('openAIStreamChunksToAnthropicEvents replaces repeated native tool snapshots', () => {
   const snapshot = {
     id: 'chatcmpl-3',

@@ -203,10 +203,62 @@ export function parseToolArguments(value) {
     return value;
   }
 
+  const repaired = repairTruncatedJsonArguments(value);
   try {
-    return JSON.parse(value);
+    return JSON.parse(repaired);
   } catch {
     return { raw: String(value) };
+  }
+}
+
+export function repairTruncatedJsonArguments(value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  try {
+    JSON.parse(value);
+    return value;
+  } catch {
+    // Repair only structurally complete strings with missing container closers.
+  }
+
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const character of value) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === '{') {
+      stack.push('}');
+    } else if (character === '[') {
+      stack.push(']');
+    } else if (character === '}' || character === ']') {
+      if (stack.pop() !== character) {
+        return value;
+      }
+    }
+  }
+
+  if (inString || escaped || stack.length === 0 || stack.length > 8) {
+    return value;
+  }
+  const candidate = `${value}${stack.reverse().join('')}`;
+  try {
+    JSON.parse(candidate);
+    return candidate;
+  } catch {
+    return value;
   }
 }
 
